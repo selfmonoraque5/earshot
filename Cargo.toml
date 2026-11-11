@@ -1,0 +1,5 @@
+# Workspace for running the core crate's tests (`cargo test -p earshot-core`). Horizon builds
+# `mixins/earshot/core` as a mod crate on its own and never reads this file.
+[workspace]
+resolver = "3"
+members = ["mixins/earshot/core"]

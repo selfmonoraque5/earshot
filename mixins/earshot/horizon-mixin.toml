@@ -1,0 +1,214 @@
+# Earshot: proximity voice chat for Horizon, compatible with Simple Voice Chat servers.
+# An independent project, not affiliated with Simple Voice Chat.
+
+[mod]
+id = "earshot"
+version = "1.0.0"
+priority = 100
+
+[compatibility]
+# Horizon fdc87ae (2026-11-07), hook API 411. Earshot needs 409 or later.
+horizon_revision = "fdc87aecdbd116bf1e08adcd062fcbaea8c2e2ca"
+
+# The game glue: `crate::game::earshot`.
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "earshot"
+source = "runtime.rs"
+
+# Everything that doesn't need the game: protocol, crypto, Opus, mixing, audio devices.
+[[crate]]
+id = "core"
+path = "core"
+
+[[injection]]
+id = "client_packet"
+hook = "client_packet"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/client_packet.rs"
+bindings = [
+    { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+    { name = "packet", ty = "&horizon_client::mod_api::ClientboundPlayPacket", value = "packet" },
+]
+
+# By path, not the `client_chat_received` hook: Horizon only calls that hook while a script mod
+# is loaded (`chat_received` returns early when `mod_api::mods()` is empty), so with native mods
+# alone it never ran. The head of `chat_received` sees every server chat line, system and player.
+[[injection]]
+id = "chat_received"
+target = "horizon_client::game::remote::Game<'_>::chat_received"
+kind = "HEAD"
+helper = "helpers/chat_received.rs"
+bindings = [
+    { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+    { name = "message", ty = "&mut horizon_client::text::Text", value = "&mut *line" },
+]
+
+[[injection]]
+id = "tick"
+hook = "tick"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/tick.rs"
+bindings = [{ name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" }]
+
+[[injection]]
+id = "key"
+hook = "key"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/key.rs"
+bindings = [
+    { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+    { name = "key", ty = "&str", value = "key" },
+    { name = "pressed", ty = "bool", value = "pressed" },
+]
+
+[[injection]]
+id = "hud"
+hook = "hud"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/hud.rs"
+bindings = [
+    { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+    { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
+    { name = "corners", ty = "&mut horizon_client::mod_api::Corners", value = "&mut *corners" },
+]
+
+# Not in native-hooks.json yet, so by path (this pins it to the commit above).
+[[injection]]
+id = "world_primitives"
+target = "horizon_client::game::native_hooks::Game<'_>::native_world_primitives"
+kind = "HEAD"
+helper = "helpers/world_primitives.rs"
+bindings = [
+    { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+    { name = "partial", ty = "f32", value = "partial" },
+    { name = "primitives", ty = "&mut horizon_client::world_primitives::WorldPrimitives", value = "&mut *primitives" },
+]
+
+[[injection]]
+id = "disconnecting"
+target = "horizon_client::game::native_hooks::Game<'_>::native_client_disconnecting"
+kind = "HEAD"
+helper = "helpers/disconnecting.rs"
+bindings = []
+
+[[injection]]
+id = "mods"
+hook = "mods"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/mods.rs"
+bindings = [{ name = "mods", ty = "&mut Vec<horizon_client::mod_api::NativeMod>", value = "&mut *mods" }]
+
+[[injection]]
+id = "settings"
+hook = "settings"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/settings.rs"
+bindings = [
+    { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+    { name = "mod_id", ty = "&str", value = "mod_id" },
+    { name = "buttons", ty = "&mut Vec<String>", value = "&mut *buttons" },
+]
+
+[[injection]]
+id = "settings_click"
+hook = "settings_click"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/settings_click.rs"
+bindings = [
+    { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+    { name = "mod_id", ty = "&str", value = "mod_id" },
+    { name = "button", ty = "usize", value = "button" },
+]
+
+[[injection]]
+id = "screen_render"
+hook = "screen_render_post"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/screen_render.rs"
+bindings = [
+    { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+    { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
+    { name = "screen", ty = "&horizon_client::mod_api::NativeScreenView<'_>", value = "screen" },
+]
+
+[[injection]]
+id = "screen_press"
+hook = "screen_mouse_button_pressed_pre"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/screen_press.rs"
+bindings = [
+    { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+    { name = "screen", ty = "&horizon_client::mod_api::NativeScreenView<'_>", value = "screen" },
+    { name = "button", ty = "i32", value = "button" },
+    { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
+
+[[injection]]
+id = "screen_release"
+hook = "screen_mouse_button_released_pre"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/screen_release.rs"
+bindings = [
+    { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+    { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
+
+[[injection]]
+id = "screen_drag"
+hook = "screen_mouse_dragged_pre"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/screen_drag.rs"
+bindings = [
+    { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+    { name = "screen", ty = "&horizon_client::mod_api::NativeScreenView<'_>", value = "screen" },
+    { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
+# The server side (dedicated servers). Horizon has no hook for other mods' plugin channels on
+# the server, so this one is by path, which pins it to the commit above.
+[[injection]]
+id = "server_packet"
+target = "horizon_client::game::lan_actions::Game<'_>::lan_guest_packet"
+kind = "HEAD"
+helper = "helpers/server_packet.rs"
+bindings = [
+    { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+    { name = "host", ty = "&mut crate::game::lan::LanHost", value = "&mut *host" },
+    { name = "conn", ty = "u32", value = "conn" },
+    { name = "packet", ty = "&horizon_protocol::packets::play::Serverbound", value = "&packet" },
+]
+[[injection]]
+id = "screen_key"
+hook = "screen_key_pressed_pre"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/screen_key.rs"
+bindings = [
+    { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+    { name = "key", ty = "&str", value = "key" },
+    { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
+
+[[injection]]
+id = "screen_char"
+hook = "screen_char_typed_pre"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/screen_char.rs"
+bindings = [
+    { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+    { name = "c", ty = "char", value = "c" },
+    { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
