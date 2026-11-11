@@ -23,7 +23,7 @@ use horizon_protocol::packets::configuration::CustomPayload;
 use super::Game;
 
 pub const ID: &str = "earshot";
-const VERSION: &str = "1.0.0";
+const VERSION: &str = "1.0.1";
 
 const KEY_MENU: (&str, &str, &str) = ("menu", "Voice menu", "key.keyboard.v");
 const KEY_PTT: (&str, &str, &str) = ("push_to_talk", "Push to talk", "key.mouse.4");

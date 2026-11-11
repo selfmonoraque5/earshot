@@ -28,6 +28,10 @@ use crate::wire::Uuid;
 /// Most speaker audio queued (100 ms): past this the oldest is dropped, bounding the delay.
 const PLAYBACK_LIMIT: usize = 5 * FRAME_SAMPLES;
 
+/// Longest the worker spends receiving before it handles the microphone and speakers (half a
+/// 20 ms frame, so neither falls behind however busy the voice server is).
+const RECEIVE_BATCH: Duration = Duration::from_millis(10);
+
 /// Player choices that affect the engine.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -557,9 +561,14 @@ fn worker(shared: Arc<Shared>) {
             }
         }
 
-        // Receive everything waiting (the 5 ms read timeout paces this loop).
+        // Receive what's waiting (the 5 ms read timeout paces this loop), for at most
+        // RECEIVE_BATCH: with several voices, packets can arrive closer together than the
+        // timeout, and the microphone and speakers below must still get their turn. What's left
+        // waits in the socket for the next pass.
         if let Some(socket) = &socket {
-            while let Ok(n) = socket.recv(&mut buf) {
+            let batch_end = Instant::now() + RECEIVE_BATCH;
+            while Instant::now() < batch_end {
+                let Ok(n) = socket.recv(&mut buf) else { break };
                 let mut inner = shared.lock();
                 let Some(key) = inner.session.key().cloned() else { break };
                 inner.udp_received += 1;

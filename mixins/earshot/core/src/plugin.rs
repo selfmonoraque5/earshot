@@ -158,14 +158,23 @@ impl Secret {
 
     /// The UDP address to use, given the host the player joined.
     /// `voice_host` may name a host, a port, or both; whatever it leaves out comes from the game connection.
+    /// IPv6 addresses come back without brackets (`::1`), as a socket address lookup wants them.
     pub fn udp_target(&self, game_host: &str) -> (String, u16) {
         let default_port = self.server_port as u16;
+        let game_host = unbracket(game_host).to_string();
         let vh = self.voice_host.trim();
         if vh.is_empty() {
-            return (game_host.to_string(), default_port);
+            return (game_host, default_port);
         }
         if let Ok(port) = vh.parse::<u16>() {
-            return (game_host.to_string(), port);
+            return (game_host, port);
+        }
+        // `[IPv6]:port` or `[IPv6]`.
+        if let Some(rest) = vh.strip_prefix('[') {
+            if let Some((host, after)) = rest.split_once(']') {
+                let port = after.strip_prefix(':').and_then(|p| p.parse::<u16>().ok()).unwrap_or(default_port);
+                return (host.to_string(), port);
+            }
         }
         // `host:port`, but not a bare IPv6 address (which has several colons).
         if let Some((host, port)) = vh.rsplit_once(':') {
@@ -177,6 +186,11 @@ impl Secret {
         }
         (vh.to_string(), default_port)
     }
+}
+
+/// `host` without the brackets an IPv6 address wears beside a port (`[::1]` -> `::1`).
+fn unbracket(host: &str) -> &str {
+    host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host)
 }
 
 /// Client -> server: voice chat switched off (`true`) or on (`false`). Muting sends nothing.
@@ -410,6 +424,7 @@ impl ServerMessage {
 mod tests {
     use super::*;
     use crate::wire::from_hex;
+    use std::net::ToSocketAddrs;
 
     const NULLPORT: &str = "c5c602ae651d38579a04b3e776be1219";
     const AIO: &str = "a1eb0477f0f03c47a9e46bc28a7d9d04";
@@ -476,6 +491,17 @@ mod tests {
         assert_eq!(sample_secret("10.0.0.5").udp_target(joined), ("10.0.0.5".into(), 24454));
         assert_eq!(sample_secret("10.0.0.5:24455").udp_target(joined), ("10.0.0.5".into(), 24455));
         assert_eq!(sample_secret("::1").udp_target(joined), ("::1".into(), 24454));
+    }
+
+    #[test]
+    fn udp_target_takes_bracketed_ipv6() {
+        assert_eq!(sample_secret("[::1]:24455").udp_target("x"), ("::1".into(), 24455));
+        assert_eq!(sample_secret("[2001:db8::7]").udp_target("x"), ("2001:db8::7".into(), 24454));
+        // The joined host may be bracketed too.
+        assert_eq!(sample_secret("").udp_target("[::1]"), ("::1".into(), 24454));
+        // What comes out resolves as an address.
+        let (host, port) = sample_secret("[::1]:24455").udp_target("x");
+        assert!((host.as_str(), port).to_socket_addrs().is_ok_and(|mut a| a.next().is_some_and(|a| a.is_ipv6())));
     }
 
     #[test]

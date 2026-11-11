@@ -22,6 +22,9 @@ pub enum Pop {
 pub struct Config {
     /// Frames to collect before starting to play (3 = 60 ms of added delay).
     pub target_frames: usize,
+    /// Ticks to wait for `target_frames` once a frame is here; then what's buffered plays anyway,
+    /// so a very short sound (a frame or two) plays now instead of before the next one.
+    pub max_wait_ticks: u32,
     /// Most frames held at once; past this the oldest go, which bounds the delay.
     pub max_frames: usize,
     /// Ticks in a row with nothing buffered that are concealed before going silent.
@@ -35,14 +38,14 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { target_frames: 3, max_frames: 12, conceal_ticks: 2, end_ticks: 10, restart_gap: 50 }
+        Self { target_frames: 3, max_wait_ticks: 6, max_frames: 12, conceal_ticks: 2, end_ticks: 10, restart_gap: 50 }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
-    /// Collecting frames before playing.
-    Buffering,
+    /// Collecting frames before playing; `waited` counts ticks since the first one came.
+    Buffering { waited: u32 },
     /// Playing; `next` is the sequence to hand out next.
     Playing { next: u64, empty_run: u32 },
 }
@@ -55,7 +58,7 @@ pub struct JitterBuffer {
 
 impl JitterBuffer {
     pub fn new(cfg: Config) -> Self {
-        Self { cfg, frames: BTreeMap::new(), state: State::Buffering }
+        Self { cfg, frames: BTreeMap::new(), state: State::Buffering { waited: 0 } }
     }
 
     /// Frames held right now.
@@ -99,8 +102,12 @@ impl JitterBuffer {
     /// Takes what to play in this 20 ms tick.
     pub fn pop(&mut self) -> Pop {
         match self.state {
-            State::Buffering => {
-                if self.frames.len() < self.cfg.target_frames {
+            State::Buffering { waited } => {
+                if self.frames.is_empty() {
+                    return Pop::Silent;
+                }
+                if self.frames.len() < self.cfg.target_frames && waited < self.cfg.max_wait_ticks {
+                    self.state = State::Buffering { waited: waited + 1 };
                     return Pop::Silent;
                 }
                 let (&first, _) = self.frames.first_key_value().unwrap();
@@ -119,7 +126,7 @@ impl JitterBuffer {
                 }
                 let empty_run = empty_run + 1;
                 if empty_run >= self.cfg.end_ticks {
-                    self.state = State::Buffering;
+                    self.state = State::Buffering { waited: 0 };
                     return Pop::Silent;
                 }
                 if empty_run <= self.cfg.conceal_ticks {
@@ -137,7 +144,7 @@ impl JitterBuffer {
 
     fn restart(&mut self) {
         self.frames.clear();
-        self.state = State::Buffering;
+        self.state = State::Buffering { waited: 0 };
     }
 }
 
@@ -265,6 +272,44 @@ mod tests {
         for s in 0..3 {
             b.push(s, frame(s));
         }
+        assert_eq!(b.pop(), Pop::Frame(frame(0)));
+    }
+
+    #[test]
+    fn a_very_short_sound_plays_after_the_wait_not_with_the_next_one() {
+        let cfg = Config::default();
+        let mut b = buf();
+        b.push(0, frame(0));
+        b.push(1, frame(1));
+        // Short of the target: it waits max_wait_ticks, then plays what came.
+        for _ in 0..cfg.max_wait_ticks {
+            assert_eq!(b.pop(), Pop::Silent);
+        }
+        assert_eq!(b.pop(), Pop::Frame(frame(0)));
+        assert_eq!(b.pop(), Pop::Frame(frame(1)));
+        // The talk spurt ends and nothing stale is left for the next one.
+        for _ in 0..cfg.end_ticks {
+            b.pop();
+        }
+        assert!(b.is_empty() && !b.is_playing());
+        for s in 2..5 {
+            b.push(s, frame(s));
+        }
+        assert_eq!(b.pop(), Pop::Frame(frame(2)));
+    }
+
+    #[test]
+    fn waiting_only_counts_once_a_frame_is_here() {
+        let cfg = Config::default();
+        let mut b = buf();
+        // A long quiet before anyone talks doesn't use up the wait.
+        for _ in 0..cfg.max_wait_ticks * 3 {
+            assert_eq!(b.pop(), Pop::Silent);
+        }
+        b.push(0, frame(0));
+        assert_eq!(b.pop(), Pop::Silent);
+        b.push(1, frame(1));
+        b.push(2, frame(2));
         assert_eq!(b.pop(), Pop::Frame(frame(0)));
     }
 

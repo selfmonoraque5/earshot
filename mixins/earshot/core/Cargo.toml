@@ -1,6 +1,6 @@
 [package]
 name = "earshot-core"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT AND BSD-3-Clause"   # our code MIT; src/opus/ is opus-rs (BSD-3-Clause, see COPYING-opus-rs)

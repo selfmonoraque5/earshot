@@ -3,7 +3,7 @@
 
 [mod]
 id = "earshot"
-version = "1.0.0"
+version = "1.0.1"
 priority = 100
 
 [compatibility]
