@@ -45,6 +45,14 @@ When you join a server that runs Simple Voice Chat, Earshot asks it for a voice 
 It then sends and receives encrypted (AES-128-GCM) voice packets over **UDP** to the address the server names (default
 port 24454). It contacts nothing else.
 
+**On a Horizon server** (a dedicated server, which has no game window), Earshot also runs a Simple Voice
+Chat-compatible **voice server**: once a player is connected, it listens for voice on **UDP port 24454 on every network
+interface** (`0.0.0.0`), and tells connected players about it over the game connection. Players' voice goes through it,
+encrypted with each player's own key. To turn it off, write `false` into the file `server_voice` in the server's
+`horizon-mods/.horizon-mod-data/earshot/` folder. In the same folder, `server_port` changes the port, and `voice_host`
+sets the address players connect to (empty: the address they joined). On a game you play yourself, with a window,
+Earshot never listens.
+
 ## Install
 
 In the Horizon launcher: Mods, find **Earshot**, Install, then **Build**. To try a local copy, put the `.hnmod` in your
@@ -55,9 +63,8 @@ instance's `horizon-native-mods/` folder and Build. The first native build takes
 Earshot needs hook API **409** or later (`compatibility.json`). Last tested on Horizon Nightly `fdc87ae` with
 horizon-mixins `5a64af9`.
 
-Not yet supported: whispering, group types other than the default, and a reply to a wrong group password. Earshot can
-also run a Simple Voice Chat-compatible voice server on a Horizon dedicated server (UDP port 24454); that part is tested
-against Earshot's own client only.
+Not yet supported: whispering, group types other than the default, and a reply to a wrong group password. The voice
+server on a Horizon dedicated server (see Network use) is tested against Earshot's own client only.
 
 ## How it works
 
