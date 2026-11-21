@@ -22,5 +22,5 @@ SOFTWARE.
 
 ---
 
-mixins/earshot/core/src/opus/ is opus-rs, under its own BSD-3-Clause license:
-see mixins/earshot/core/COPYING-opus-rs.
+src/core/src/opus/ is opus-rs, under its own BSD-3-Clause license:
+see COPYING-opus-rs.

@@ -50,20 +50,19 @@ switch for connection details.
 ## Network use
 
 When you join a server that runs Simple Voice Chat, Earshot asks it for a voice key over the game connection.
-It then sends and receives encrypted (AES-128-GCM) voice packets over **UDP** to the address the server names (default
-port 24454). It contacts nothing else.
+It uses **UDP** for encrypted (AES-128-GCM) voice packets. The game server can name a separate voice host and port.
 
-> **Not in this version:** hosting voice on a Horizon dedicated server is off; it comes back in a later version.
-> Joining servers is unaffected.
+Earshot opens the microphone when voice chat is enabled, the mic is unmuted, and either the game server supplies
+voice connection details or you start the mic test. Muting closes the microphone while keeping playback available
+in a voice session. Switching **Voice chat** off closes both audio streams. The mic test is unavailable while muted
+or switched off.
 
-**On a Horizon server** (a dedicated server, which has no game window), Earshot also runs a Simple Voice
-Chat-compatible **voice server**: once a player is connected, it listens for voice on **UDP port 24454 on every network
-interface** (`0.0.0.0`), and tells connected players about it over the game connection. Players' voice goes through it,
-encrypted with each player's own key. Its settings are `key=value` lines in `server.txt`, in the server's
-`horizon-mod-data/earshot/` folder: `server_voice=false` turns it off, `max_distance` and `whisper_distance` set how
-far voices and whispers carry (48 and half of it), `server_port` changes the port, and `voice_host` sets the address
-players connect to (empty: the address they joined). Only a dedicated server listens: in single
-player, in a world opened to LAN, or as a player joining a server, Earshot opens no port.
+Earshot sends microphone audio only over a connected voice session when voice chat is enabled, the mic is unmuted,
+and push-to-talk, whisper, or voice activation is active. The mic test plays back locally and does not start
+transmission on its own.
+
+**Earshot 2.0.3 does not host voice on Horizon dedicated servers.** It can still join servers running Simple Voice Chat.
+Earshot 1.x could host voice on a dedicated server and listened on UDP port 24454 on all interfaces by default.
 
 ## Install
 
@@ -80,7 +79,7 @@ From GitHub:
    minutes). After a build the launcher can look stuck for a while as it cleans its cache: let it finish.
 4. When it says **Up to date**, play.
 
-Once it is listed in the Horizon registry: Mods, find **Earshot**, Install.
+From the Horizon registry, open **Mods**, find **Earshot**, and choose **Install**.
 
 To build a local copy: `horizon-launcher native-build <this folder> --instance <instance> --trust-native-code`.
 
@@ -104,19 +103,15 @@ on the server); it used a game patch that stopped compiling after Horizon's game
 ([horizon-rust/horizon#18462](https://github.com/horizon-rust/horizon/issues/18462), since fixed in the launcher), so it
 is off in this version and comes back once that patch is tested again.
 
-The voice server on a Horizon dedicated server (see Network use) does proximity voice, whispers and voice groups of
-all three types; so far it is tested against Earshot's own client only.
-
 ## How it works
 
 | Path | What |
 |---|---|
-| `horizon-mod.toml` | The manifest: id, version, the Horizon build it is made for, and the server's game patch |
+| `horizon-mod.toml` | Mod manifest and Horizon build requirements |
 | `src/lib.rs` | The hooks |
 | `src/client.rs` | The voice client between hooks: keys, positions, the HUD, the name tag icons, the voice menu and its settings |
-| `src/server.rs` | The voice server on a dedicated server, and its settings |
+| `src/server.rs` | Dedicated-server voice code and settings. Hosting is disabled in this release. |
 | `src/text_json.rs` | Chat lines between the mod API's text and the JSON `earshot_core::chat` rewrites |
-| `src/mixins/server_packet.rs` | The game patch: players' voice chat packets to the voice server |
 | `src/core` | `earshot-core`, everything that doesn't need the game: the wire format, AES-128-GCM, Opus, jitter buffer, mixing, positional audio, the voice server, the menu and the icons |
 | `src/core/src/opus` | opus-rs 0.1.41, vendored (see below) |
 | `PROTOCOL.md` | What Earshot knows of the voice protocol, and the capture each fact came from |
@@ -131,7 +126,7 @@ Shipped in the mod (Horizon only allows crates already in its own `Cargo.lock`):
 
 | Dependency | Version | License | How it's used |
 |---|---|---|---|
-| [opus-rs](https://github.com/restsend/opus-rs) | 0.1.41 | BSD-3-Clause (© restsend.com; © Xiph.Org, Skype Limited, Octasic, Jean-Marc Valin, Timothy B. Terriberry, CSIRO, Gregory Maxwell, Mark Borgerding, Erik de Castro Lopo, Mozilla, Amazon) | Vendored source in `src/core/src/opus/`, license in `COPYING-opus-rs`; changed only its `crate::` paths |
+| [opus-rs](https://github.com/restsend/opus-rs) | 0.1.41 | BSD-3-Clause (© restsend.com; © Xiph.Org, Skype Limited, Octasic, Jean-Marc Valin, Timothy B. Terriberry, CSIRO, Gregory Maxwell, Mark Borgerding, Erik de Castro Lopo, Mozilla, Amazon) | Vendored source in `src/core/src/opus/`, license in `COPYING-opus-rs`; adapted module paths and attributes, enabled the upstream default `std` and `heap` code, and removed the packet-loss audio trace |
 | [aes](https://crates.io/crates/aes) | 0.8.4 | MIT OR Apache-2.0 | AES block cipher; GCM is our own code on top of it |
 | [getrandom](https://crates.io/crates/getrandom) | 0.3.4 | MIT OR Apache-2.0 | Random nonces |
 | [cpal](https://crates.io/crates/cpal) | 0.16.0 | Apache-2.0 | Microphone and speakers |

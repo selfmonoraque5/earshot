@@ -9,7 +9,6 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -43,55 +42,54 @@ pub fn output_devices() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Running microphone and speaker streams. Dropping it stops them.
-pub struct AudioIo {
+/// A device thread owns its CPAL stream. Dropping it stops that stream.
+pub(crate) struct AudioIo {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    /// What each side is using, or why it isn't (for the settings page and logs).
-    pub input: Result<String, String>,
-    pub output: Result<String, String>,
 }
 
 impl AudioIo {
-    /// Opens the named devices, or the system defaults for `None` or a name that's gone.
-    pub fn start(input: Option<String>, output: Option<String>, capture: CaptureQueue, playback: PlaybackQueue) -> AudioIo {
+    pub(crate) fn start<D: PartialEq>(
+        name: &str,
+        wanted: impl Fn() -> Option<D> + Send + 'static,
+        open: impl Fn(&cpal::Host, &D) -> Result<(String, cpal::Stream), String> + Send + 'static,
+        status: impl Fn(String) + Send + 'static,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel();
-        let stop2 = stop.clone();
+        let stopping = stop.clone();
         let thread = std::thread::Builder::new()
-            .name("earshot-audio".into())
+            .name(name.into())
             .spawn(move || {
-                let host = cpal::default_host();
-                // A chosen device that won't open (on Linux, ALSA lists plugins such as `jack` or
-                // `oss` that often don't work) falls back to the system default, saying why.
-                let inp = open_input(&host, input.as_deref(), capture.clone()).or_else(|e| match input.as_deref() {
-                    Some(name) => open_input(&host, None, capture)
-                        .map(|(d, s)| (format!("{d} (\"{name}\" failed: {e})"), s))
-                        .map_err(|e2| format!("{e}; default: {e2}")),
-                    None => Err(e),
-                });
-                let out = open_output(&host, output.as_deref(), playback.clone()).or_else(|e| match output.as_deref() {
-                    Some(name) => open_output(&host, None, playback)
-                        .map(|(d, s)| (format!("{d} (\"{name}\" failed: {e})"), s))
-                        .map_err(|e2| format!("{e}; default: {e2}")),
-                    None => Err(e),
-                });
-                let _ = tx.send((
-                    inp.as_ref().map(|(n, _)| n.clone()).map_err(Clone::clone),
-                    out.as_ref().map(|(n, _)| n.clone()).map_err(Clone::clone),
-                ));
-                // Keep the streams alive until asked to stop.
-                while !stop2.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(50));
+                let mut current = None;
+                let mut stream = None;
+                while !stopping.load(Ordering::Relaxed) {
+                    let next = wanted();
+                    if next != current {
+                        drop(stream.take());
+                        current = next;
+                        status("closed".into());
+                        if let Some(device) = &current {
+                            let opened = open(&cpal::default_host(), device);
+                            // The player may have muted, disconnected or changed devices while
+                            // opening the stream. Drop that stream before handling the new request.
+                            if stopping.load(Ordering::Relaxed) || wanted() != current {
+                                current = None;
+                                continue;
+                            }
+                            match opened {
+                                Ok((name, handle)) => {
+                                    stream = Some(handle);
+                                    status(name);
+                                }
+                                Err(e) => status(format!("none ({e})")),
+                            }
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
                 }
-                drop(inp);
-                drop(out);
             })
             .ok();
-        let (input, output) = rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap_or_else(|_| (Err("audio thread didn't start".into()), Err("audio thread didn't start".into())));
-        AudioIo { stop, thread, input, output }
+        Self { stop, thread }
     }
 }
 
@@ -113,7 +111,23 @@ fn pick(devices: impl Iterator<Item = cpal::Device>, name: Option<&str>, default
     default
 }
 
-fn open_input(host: &cpal::Host, name: Option<&str>, capture: CaptureQueue) -> Result<(String, cpal::Stream), String> {
+// A chosen device that fails falls back to the system default, retaining the original error.
+fn with_fallback(
+    name: Option<&str>, open: impl Fn(Option<&str>) -> Result<(String, cpal::Stream), String>,
+) -> Result<(String, cpal::Stream), String> {
+    open(name).or_else(|e| match name {
+        Some(name) => open(None)
+            .map(|(device, stream)| (format!("{device} (\"{name}\" failed: {e})"), stream))
+            .map_err(|e2| format!("{e}; default: {e2}")),
+        None => Err(e),
+    })
+}
+
+pub(crate) fn open_input(host: &cpal::Host, name: Option<&str>, capture: CaptureQueue) -> Result<(String, cpal::Stream), String> {
+    with_fallback(name, |name| try_open_input(host, name, capture.clone()))
+}
+
+fn try_open_input(host: &cpal::Host, name: Option<&str>, capture: CaptureQueue) -> Result<(String, cpal::Stream), String> {
     let devices = host.input_devices().map_err(|e| e.to_string())?;
     let device = pick(devices, name, host.default_input_device()).ok_or("no microphone found")?;
     let supported = device.default_input_config().map_err(|e| e.to_string())?;
@@ -162,7 +176,11 @@ where
         .map_err(|e| e.to_string())
 }
 
-fn open_output(host: &cpal::Host, name: Option<&str>, playback: PlaybackQueue) -> Result<(String, cpal::Stream), String> {
+pub(crate) fn open_output(host: &cpal::Host, name: Option<&str>, playback: PlaybackQueue) -> Result<(String, cpal::Stream), String> {
+    with_fallback(name, |name| try_open_output(host, name, playback.clone()))
+}
+
+fn try_open_output(host: &cpal::Host, name: Option<&str>, playback: PlaybackQueue) -> Result<(String, cpal::Stream), String> {
     let devices = host.output_devices().map_err(|e| e.to_string())?;
     let device = pick(devices, name, host.default_output_device()).ok_or("no speakers found")?;
     let supported = device.default_output_config().map_err(|e| e.to_string())?;

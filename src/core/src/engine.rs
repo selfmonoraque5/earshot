@@ -6,10 +6,9 @@
 //! returns over the game connection.
 //!
 //! One worker thread does the rest: the UDP socket, the handshake's retries, encoding the
-//! microphone and keeping the speakers fed from the [`Mixer`]. Audio devices are opened by the
-//! worker too, so the game never waits on them.
+//! microphone and keeping the speakers fed from the [`Mixer`]. Each audio device has its own
+//! worker, so the game never waits on hardware.
 
-use std::collections::VecDeque;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -17,6 +16,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::activation::{self, Activation, Mode};
+use crate::audio::{self, AudioIo, CaptureQueue, PlaybackQueue};
 use crate::codec::{Encoder, FRAME_SAMPLES};
 use crate::mixer::Mixer;
 use crate::plugin::{self, Secret, ServerMessage};
@@ -132,7 +132,7 @@ struct Inner {
     activation: Activation,
     suppressor: crate::dsp::NoiseSuppressor,
     settings: Settings,
-    reopen_audio: bool,
+    capture: CaptureQueue,
     ptt_down: bool,
     /// The whisper key is held: send whatever the mode, marked as a whisper.
     whisper_down: bool,
@@ -155,6 +155,26 @@ struct Inner {
     mic_test: bool,
     /// Our group and its other members as last seen, to chime when they change.
     group_view: crate::chime::GroupView,
+}
+
+impl Inner {
+    fn audio_devices(&self) -> (Option<Option<String>>, Option<Option<String>>) {
+        let voice = self.target.is_some();
+        let test = self.mic_test && !self.muted;
+        let active = self.settings.use_audio_devices && !self.session.disabled && (voice || test);
+        let input = (active && !self.muted).then(|| self.settings.input_device.clone());
+        let output = active.then(|| self.settings.output_device.clone());
+        (input, output)
+    }
+
+    fn reset_capture(&mut self) {
+        // The old stream can still have a callback in flight. Give the next stream a
+        // fresh queue so muted or disconnected audio cannot leak into a later session.
+        self.capture = Default::default();
+        self.level = -127.0;
+        self.transmitting = false;
+        self.activation = Activation::new(self.settings.mode);
+    }
 }
 
 struct Shared {
@@ -197,15 +217,15 @@ impl VoiceClient {
             activation: Activation::new(settings.mode),
             suppressor: crate::dsp::NoiseSuppressor::new(),
             settings,
-            reopen_audio: false,
+            capture: Default::default(),
             ptt_down: false,
             whisper_down: false,
             muted: false,
             deafened: false,
             transmitting: false,
             level: -127.0,
-            input_device: String::new(),
-            output_device: String::new(),
+            input_device: "closed".into(),
+            output_device: "closed".into(),
             udp_sent: 0,
             udp_received: 0,
             udp_error: None,
@@ -291,18 +311,25 @@ impl VoiceClient {
     }
 
     pub fn set_muted(&self, muted: bool) {
-        self.shared.lock().muted = muted;
+        let mut inner = self.shared.lock();
+        if muted && !inner.muted {
+            inner.reset_capture();
+        }
+        inner.muted = muted;
     }
 
     pub fn set_deafened(&self, deafened: bool) {
         let mut inner = self.shared.lock();
         inner.deafened = deafened;
-        inner.mixer.deafened = deafened;
+        inner.mixer.deafened = inner.session.disabled || deafened;
     }
 
     /// Voice chat off entirely: the server is told, as SVC's own toggle does.
     pub fn set_disabled(&self, disabled: bool) {
         let mut inner = self.shared.lock();
+        if disabled && !inner.session.disabled {
+            inner.reset_capture();
+        }
         let actions = inner.session.set_disabled(disabled);
         inner.mixer.deafened = disabled || inner.deafened;
         run_actions(&mut inner, actions);
@@ -345,8 +372,8 @@ impl VoiceClient {
 
     pub fn apply_settings(&self, settings: Settings) {
         let mut inner = self.shared.lock();
-        if settings.input_device != inner.settings.input_device || settings.output_device != inner.settings.output_device {
-            inner.reopen_audio = true;
+        if settings.input_device != inner.settings.input_device || !settings.use_audio_devices && inner.settings.use_audio_devices {
+            inner.reset_capture();
         }
         inner.activation.mode = settings.mode;
         inner.mixer.volume = settings.output_volume;
@@ -400,6 +427,7 @@ impl VoiceClient {
     pub fn disconnect(&self) {
         let mut inner = self.shared.lock();
         inner.session.reset();
+        inner.reset_capture();
         inner.socket = None;
         inner.target = None;
         inner.encoder = None;
@@ -572,17 +600,44 @@ fn open_socket(host: &str, port: u16) -> Result<UdpSocket, String> {
     Ok(socket)
 }
 
-#[cfg(all())]
-type Audio = crate::audio::AudioIo;
-#[cfg(not(all()))]
-type Audio = ();
+struct InputDevice {
+    name: Option<String>,
+    queue: CaptureQueue,
+}
+
+impl PartialEq for InputDevice {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && Arc::ptr_eq(&self.queue, &other.queue)
+    }
+}
+
+fn start_audio(shared: &Arc<Shared>, playback: PlaybackQueue) -> (AudioIo, AudioIo) {
+    let input = shared.clone();
+    let output = shared.clone();
+    let input_status = shared.clone();
+    let output_status = shared.clone();
+    (
+        AudioIo::start(
+            "earshot-input",
+            move || {
+                let inner = input.lock();
+                inner.audio_devices().0.map(|name| InputDevice { name, queue: inner.capture.clone() })
+            },
+            |host, device| audio::open_input(host, device.name.as_deref(), device.queue.clone()),
+            move |status| input_status.lock().input_device = status,
+        ),
+        AudioIo::start(
+            "earshot-output",
+            move || output.lock().audio_devices().1,
+            move |host, device| audio::open_output(host, device.as_deref(), playback.clone()),
+            move |status| output_status.lock().output_device = status,
+        ),
+    )
+}
 
 fn worker(shared: Arc<Shared>) {
-    let capture: Arc<Mutex<VecDeque<f32>>> = Default::default();
-    let playback: Arc<Mutex<VecDeque<[f32; 2]>>> = Default::default();
-    // Filled by a helper thread, so opening slow devices never holds up the network.
-    let audio: Arc<Mutex<Option<Audio>>> = Default::default();
-    let opening_audio = Arc::new(AtomicBool::new(false));
+    let playback = PlaybackQueue::default();
+    let _audio = start_audio(&shared, playback.clone());
     let mut buf = vec![0u8; 2048];
     let mut mixed_frames = shared.now() / 20;
 
@@ -621,37 +676,6 @@ fn worker(shared: Arc<Shared>) {
             }
             inner.socket.as_ref().and_then(|s| s.try_clone().ok())
         };
-
-        // Audio devices: opened once a voice server exists (or for the mic test), reopened when
-        // the player picks others.
-        {
-            let mut inner = shared.lock();
-            let wanted = (inner.target.is_some() || inner.mic_test) && inner.settings.use_audio_devices;
-            let have = audio.lock().map(|a| a.is_some()).unwrap_or(false);
-            if ((wanted && !have) || inner.reopen_audio) && !opening_audio.swap(true, Ordering::SeqCst) {
-                inner.reopen_audio = false;
-                let (i, o) = (inner.settings.input_device.clone(), inner.settings.output_device.clone());
-                drop(inner);
-                let (audio, opening, shared) = (audio.clone(), opening_audio.clone(), shared.clone());
-                let (capture, playback) = (capture.clone(), playback.clone());
-                let _ = std::thread::Builder::new().name("earshot-audio-open".into()).spawn(move || {
-                    // Release the old devices before opening the new ones.
-                    if let Ok(mut a) = audio.lock() {
-                        a.take();
-                    }
-                    let io = open_audio(i, o, capture, playback, &shared);
-                    if let Ok(mut a) = audio.lock() {
-                        *a = Some(io);
-                    }
-                    opening.store(false, Ordering::SeqCst);
-                });
-            } else if !wanted && have && !opening_audio.load(Ordering::SeqCst) {
-                drop(inner);
-                if let Ok(mut a) = audio.lock() {
-                    a.take();
-                }
-            }
-        }
 
         // Receive what's waiting (the 5 ms read timeout paces this loop), for at most
         // RECEIVE_BATCH: with several voices, packets can arrive closer together than the
@@ -705,7 +729,7 @@ fn worker(shared: Arc<Shared>) {
         // Microphone: one Opus frame per 960 captured samples.
         loop {
             let frame: [f32; FRAME_SAMPLES] = {
-                let Ok(mut q) = capture.lock() else { break };
+                let Ok(mut q) = inner.capture.lock() else { break };
                 if q.len() < FRAME_SAMPLES {
                     break;
                 }
@@ -732,13 +756,12 @@ fn worker(shared: Arc<Shared>) {
             q.drain(..excess);
         }
     }
-    // Close the devices with the client.
-    if let Ok(mut a) = audio.lock() {
-        a.take();
-    }
 }
 
 fn send_mic_frame(inner: &mut Inner, mut frame: [f32; FRAME_SAMPLES]) {
+    if inner.muted || inner.session.disabled {
+        return;
+    }
     let gain = inner.settings.mic_volume;
     if gain != 1.0 {
         for s in frame.iter_mut() {
@@ -757,7 +780,7 @@ fn send_mic_frame(inner: &mut Inner, mut frame: [f32; FRAME_SAMPLES]) {
     }
     // Holding the whisper key sends whatever the mode (as SVC's whisper key did in capture 07).
     let wants = inner.activation.frame(inner.level, inner.ptt_down) || inner.whisper_down;
-    let send = wants && !inner.muted && !inner.session.disabled && inner.session.is_connected();
+    let send = wants && inner.session.is_connected();
     inner.transmitting = send;
     if !send {
         return;
@@ -778,31 +801,6 @@ fn send_mic_frame(inner: &mut Inner, mut frame: [f32; FRAME_SAMPLES]) {
     send_udp(inner, &msg);
 }
 
-#[cfg(all())]
-fn open_audio(
-    input: Option<String>,
-    output: Option<String>,
-    capture: Arc<Mutex<VecDeque<f32>>>,
-    playback: Arc<Mutex<VecDeque<[f32; 2]>>>,
-    shared: &Shared,
-) -> Audio {
-    let io = crate::audio::AudioIo::start(input, output, capture, playback);
-    let mut inner = shared.lock();
-    inner.input_device = io.input.clone().unwrap_or_else(|e| format!("none ({e})"));
-    inner.output_device = io.output.clone().unwrap_or_else(|e| format!("none ({e})"));
-    io
-}
-
-#[cfg(not(all()))]
-fn open_audio(
-    _input: Option<String>,
-    _output: Option<String>,
-    _capture: Arc<Mutex<VecDeque<f32>>>,
-    _playback: Arc<Mutex<VecDeque<[f32; 2]>>>,
-    _shared: &Shared,
-) -> Audio {
-}
-
 #[cfg(test)]
 mod tests {
     //! End to end against a fake SVC voice server on localhost: the real UDP path, sockets,
@@ -820,6 +818,53 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn audio_devices_follow_mute_and_voice_chat() {
+        let client = VoiceClient::new(Settings { use_audio_devices: false, ..Settings::default() });
+        let mut inner = client.shared.lock();
+        inner.target = Some(("127.0.0.1".into(), 1));
+        assert_eq!(inner.audio_devices(), (None, None));
+        inner.settings.use_audio_devices = true;
+        assert_eq!(inner.audio_devices(), (Some(None), Some(None)));
+        inner.muted = true;
+        assert_eq!(inner.audio_devices(), (None, Some(None)));
+        inner.session.disabled = true;
+        assert_eq!(inner.audio_devices(), (None, None));
+        inner.muted = false;
+        assert_eq!(inner.audio_devices(), (None, None));
+        inner.session.disabled = false;
+        assert_eq!(inner.audio_devices(), (Some(None), Some(None)));
+
+        inner.target = None;
+        assert_eq!(inner.audio_devices(), (None, None));
+        inner.mic_test = true;
+        assert_eq!(inner.audio_devices(), (Some(None), Some(None)));
+        inner.muted = true;
+        assert_eq!(inner.audio_devices(), (None, None));
+        inner.muted = false;
+        inner.session.disabled = true;
+        assert_eq!(inner.audio_devices(), (None, None));
+        inner.settings.use_audio_devices = false;
+    }
+
+    #[test]
+    fn rapid_unmute_and_reenable_never_reuse_the_old_capture_queue() {
+        let client = VoiceClient::new(Settings { use_audio_devices: false, ..Settings::default() });
+        let before_mute = client.shared.lock().capture.clone();
+        client.set_muted(true);
+        before_mute.lock().unwrap().push_back(1.0);
+        client.set_muted(false);
+        let before_disable = client.shared.lock().capture.clone();
+        assert!(!Arc::ptr_eq(&before_mute, &before_disable));
+        assert!(before_disable.lock().unwrap().is_empty());
+        client.set_disabled(true);
+        before_disable.lock().unwrap().push_back(1.0);
+        client.set_disabled(false);
+        let after_disable = client.shared.lock().capture.clone();
+        assert!(!Arc::ptr_eq(&before_disable, &after_disable));
+        assert!(after_disable.lock().unwrap().is_empty());
     }
 
     #[test]

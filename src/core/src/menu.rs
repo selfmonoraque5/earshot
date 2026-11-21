@@ -376,7 +376,14 @@ impl Menu {
                 if m.push_to_talk {
                     row.push(Widget::new(Id::PttStyle, Kind::Button, if m.ptt_toggle { "Press to switch" } else { "Hold to talk" }));
                 }
-                row.push(Widget::new(Id::MicTest, Kind::Button, if m.mic_test { "Mic test: on" } else { "Mic test" }).on(m.mic_test));
+                let mic_test = if m.muted || m.disabled {
+                    "Mic test unavailable"
+                } else if m.mic_test {
+                    "Mic test: on"
+                } else {
+                    "Mic test"
+                };
+                row.push(Widget::new(Id::MicTest, Kind::Button, mic_test).on(m.mic_test && !m.muted && !m.disabled));
                 b.row(row);
                 let meter = if m.push_to_talk {
                     format!("Mic level {:.0} dB", m.level_db)
@@ -603,7 +610,7 @@ impl Menu {
             Id::VoiceChat => Some(MenuAction::ToggleVoiceChat),
             Id::Mode => Some(MenuAction::ToggleMode),
             Id::PttStyle => Some(MenuAction::TogglePttStyle),
-            Id::MicTest => Some(MenuAction::ToggleMicTest),
+            Id::MicTest => (!m.muted && !m.disabled).then_some(MenuAction::ToggleMicTest),
             Id::GroupSounds => Some(MenuAction::ToggleGroupSounds),
             Id::Noise => Some(MenuAction::ToggleNoiseSuppression),
             Id::Microphone => Some(MenuAction::NextMicrophone),
