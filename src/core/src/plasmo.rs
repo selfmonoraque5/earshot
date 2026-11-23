@@ -580,6 +580,8 @@ pub struct Plasmo {
     sources: HashMap<Uuid, Source>,
     asked: HashSet<Uuid>,
     pub players: HashMap<Uuid, PlayerInfo>,
+    /// We sent our player info (and key) in this session.
+    introduced: bool,
     sequence: u64,
     last_heard: u64,
     last_hello: Option<u64>,
@@ -733,8 +735,15 @@ impl Plasmo {
 
     /// Our player info with `key`'s public half: the answer to the server's request, or sent
     /// unasked (the server takes it either way) when voice chat is switched back on.
-    pub fn introduce(&self, key: &KeyPair) -> Vec<Do> {
+    pub fn introduce(&mut self, key: &KeyPair) -> Vec<Do> {
+        self.introduced = true;
         vec![Do::Tcp(player_info(self.voice_disabled, self.mic_muted, &key.public_der))]
+    }
+
+    /// Whether we sent our player info in this session: a new request for it after that is the
+    /// server starting over.
+    pub fn introduced(&self) -> bool {
+        self.introduced
     }
 
     /// Now and then: ping until configured, and notice a server that went quiet.

@@ -310,8 +310,27 @@ impl VoiceClient {
         } else if channel == plasmo::CHANNEL {
             // Voice chat off: nothing is negotiated or answered (the server asks again later).
             if !inner.session.disabled {
+                match plasmo::decode_tcp(data) {
+                    // The server starting over (after a timeout, a reload or /vreconnect): the
+                    // old session, its key and everything bound to it are retired, and a new
+                    // one answers with a new key.
+                    Ok(plasmo::FromServer::PlayerInfoRequest) if inner.plasmo.as_ref().is_some_and(Plasmo::introduced) => {
+                        plasmo_retire(&mut inner);
+                    }
+                    // A new voice address within the session: its socket and anything queued
+                    // are bound to a new session number, so nothing of the old one goes out.
+                    Ok(plasmo::FromServer::Connection { .. }) if inner.plasmo.as_ref().is_some_and(Plasmo::connecting) => {
+                        plasmo_renumber(&mut inner);
+                    }
+                    _ => {}
+                }
                 if inner.plasmo_key.is_none() {
                     inner.plasmo_key = plasmo_key_take();
+                    if inner.plasmo_key.is_none() {
+                        // No key ready yet: introduce ourselves once there is (the server may
+                        // not ask again).
+                        inner.plasmo_resume = true;
+                    }
                 }
                 plasmo_start(&mut inner);
                 let muted = inner.muted;
@@ -740,7 +759,7 @@ fn plasmo_register(inner: &mut Inner) {
 /// Introduces us to the Plasmo Voice server after voice chat was switched back on, with a new
 /// key, once one is ready (tried each tick until then).
 fn plasmo_resume(inner: &mut Inner) {
-    if !inner.plasmo_resume || inner.session.disabled || inner.plasmo.is_some() {
+    if !inner.plasmo_resume || inner.session.disabled || inner.plasmo.as_ref().is_some_and(Plasmo::introduced) {
         return;
     }
     let Some(key) = plasmo_key_take() else { return };
@@ -769,6 +788,35 @@ fn plasmo_start(inner: &mut Inner) {
         inner.socket = None;
     }
     inner.whisper_down = false;
+    inner.transmitting = false;
+    inner.reset_capture();
+}
+
+/// Ends the Plasmo Voice session: its negotiation state, key, voice address, socket, queued
+/// packets and captured audio all go. The channel registration and voice chat's state stay.
+fn plasmo_retire(inner: &mut Inner) {
+    inner.plasmo = None;
+    inner.plasmo_key = None;
+    inner.outbox.retain(|(o, ..)| !matches!(o, Owner::Plasmo(n) if *n != 0));
+    if inner.target.as_ref().is_some_and(|(o, ..)| matches!(o, Owner::Plasmo(_))) {
+        inner.target = None;
+        inner.socket = None;
+        inner.encoder = None;
+    }
+    inner.transmitting = false;
+    inner.reset_capture();
+}
+
+/// A new voice address for the session (the server's `Connection` again): a new session number,
+/// so the old socket and anything queued under the old number are never used.
+fn plasmo_renumber(inner: &mut Inner) {
+    let old = plasmo_owner(inner);
+    inner.plasmo_epoch += 1;
+    inner.outbox.retain(|(o, ..)| *o != old);
+    if inner.target.as_ref().is_some_and(|(o, ..)| *o == old) {
+        inner.target = None;
+        inner.socket = None;
+    }
     inner.transmitting = false;
     inner.reset_capture();
 }
@@ -861,11 +909,10 @@ fn run_plasmo(inner: &mut Inner, todo: Vec<plasmo::Do>) {
             }
             plasmo::Do::Lost(why) => {
                 eprintln!("[earshot] voice: {why}");
-                // The next connection gets a new key, and the address the server gives then.
-                inner.socket = None;
-                inner.target = None;
-                inner.plasmo_key = None;
-                inner.reset_capture();
+                // The session ends here: the next one (when the server asks again) gets a new
+                // number, a new key and the address the server gives then.
+                plasmo_retire(inner);
+                return;
             }
         }
     }
@@ -1515,7 +1562,35 @@ mod tests {
         client.set_disabled(false);
         let out = client.take_outgoing();
         assert_eq!(out.len(), 1);
-        assert_ne!(fake::public_key_of(&out[0].1), public, "a fresh key for each connection");
+        let second = fake::public_key_of(&out[0].1);
+        assert_ne!(second, public, "a fresh key for each connection");
+
+        // 9. The server starts over (as after a timeout or /vreconnect): asked again, the old
+        // session, its number and its key are retired, and the answer carries a new key.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while PLASMO_NEXT_KEY.lock().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "no third key");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let epoch = client.shared.lock().plasmo_epoch;
+        client.shared.lock().outbox.push((Owner::Plasmo(epoch), plasmo::CHANNEL, vec![9]));
+        client.on_plugin(plasmo::CHANNEL, &fake::request(), "127.0.0.1");
+        let out = client.take_outgoing();
+        assert_eq!(out.len(), 1, "the old session's queue is gone: {out:?}");
+        assert_ne!(fake::public_key_of(&out[0].1), second, "a new key on restart");
+        assert!(client.shared.lock().plasmo_epoch > epoch, "a new session number");
+
+        // 10. A new address within a session: a new number, the old socket and queue unused.
+        let secret = Uuid([6; 16]);
+        client.on_plugin(plasmo::CHANNEL, &fake::connection(&secret, "0.0.0.0", port), "127.0.0.1");
+        let epoch = client.shared.lock().plasmo_epoch;
+        client.shared.lock().outbox.push((Owner::Plasmo(epoch), plasmo::CHANNEL, vec![9]));
+        client.on_plugin(plasmo::CHANNEL, &fake::connection(&Uuid([4; 16]), "0.0.0.0", port), "127.0.0.1");
+        let inner = client.shared.lock();
+        assert_eq!(inner.plasmo_epoch, epoch + 1);
+        assert!(inner.outbox.iter().all(|(o, ..)| *o != Owner::Plasmo(epoch)));
+        assert!(inner.target.as_ref().is_some_and(|(o, ..)| *o == Owner::Plasmo(epoch + 1)));
+        drop(inner);
 
         client.disconnect();
         assert!(!client.status().connected);
