@@ -26,7 +26,8 @@ those mods, and with other Horizon players using Earshot.
 - **Push to talk** (Mouse 4), held or pressed once to switch on and off, or **voice activation** with an adjustable
   threshold and a live mic level.
 - A **mic test** in the settings: hear yourself as the others would.
-- **Whisper** (Mouse 5, held): talk so only players close by hear you (the server sets how close).
+- **Whisper** (Mouse 5, held): talk so only players close by hear you (the server sets how close). Simple Voice Chat
+  servers only: Plasmo Voice has no whisper, so there the key does nothing.
 - **Voice groups**: create one (normal, open or isolated, with an optional password), join one with a click, leave it. Group members hear each
   other at any distance, and a panel in the top-left corner lists them, lighting up whoever is talking. A **group volume**,
   and a short **chime** when someone joins or leaves your group (Earshot's own sound; it can be turned off).
@@ -58,7 +59,8 @@ switch for connection details.
 - Servers running **Simple Voice Chat 2.6.27** (compatibility version 20): Fabric and Paper (the Bukkit plugin).
 - 2.0 tested in game on Windows with Simple Voice Chat servers. Earshot 1.x was also tested on Linux (PipeWire),
   but 2.0 doesn't build on Linux yet (see Compatibility).
-- Servers running **Plasmo Voice 2.x** (tested against its protocol as of 2.1.17 and 2.2.0 beta; not yet in game).
+- Servers running **Plasmo Voice 2.x** (tested in game with 2.2.0-beta.4 on Paper; protocol as of 2.1.17
+  and 2.2.0 beta).
 - A server without either: Earshot stays quiet and sends nothing.
 
 ## Network use
@@ -68,8 +70,10 @@ It uses **UDP** for encrypted (AES-128-GCM) voice packets, to the address the se
 contacts nothing else.
 
 On a server that runs Plasmo Voice, Earshot registers Plasmo Voice's channel, sends the server an RSA public key (made
-on your computer each time the game starts) and gets back the voice address and an AES audio key sealed to that key.
-Voice packets then go over **UDP**, AES-128-CBC encrypted, to the address the server names (default port 60606).
+on your computer, a new one for each voice connection) and gets back the voice address and an AES audio key sealed to
+that key. Voice packets then go over **UDP**, AES-128-CBC encrypted, to the address the server names for that
+connection. With **Voice chat** off, none of this happens: Earshot doesn't register the channel or answer the server,
+and switching it off drops the connection, its key and anything not yet sent.
 
 Earshot opens the microphone when voice chat is enabled, the mic is unmuted, and either the game server supplies
 voice connection details or you start the mic test. Muting closes the microphone while keeping playback available

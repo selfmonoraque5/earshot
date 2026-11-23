@@ -631,10 +631,7 @@ impl Plasmo {
         match msg {
             // The server repeats this until it has our key, so without one yet there's no harm
             // in waiting.
-            FromServer::PlayerInfoRequest => match key {
-                Some(k) => vec![Do::Tcp(player_info(self.voice_disabled, self.mic_muted, &k.public_der))],
-                None => vec![],
-            },
+            FromServer::PlayerInfoRequest => key.map(|k| self.introduce(k)).unwrap_or_default(),
             FromServer::Connection { secret, ip, port } => {
                 let host = if ip.is_empty() || ip == "0.0.0.0" { game_host.to_string() } else { ip };
                 self.secret = Some(secret);
@@ -732,6 +729,12 @@ impl Plasmo {
             }
             Datagram::Other(_) => vec![],
         }
+    }
+
+    /// Our player info with `key`'s public half: the answer to the server's request, or sent
+    /// unasked (the server takes it either way) when voice chat is switched back on.
+    pub fn introduce(&self, key: &KeyPair) -> Vec<Do> {
+        vec![Do::Tcp(player_info(self.voice_disabled, self.mic_muted, &key.public_der))]
     }
 
     /// Now and then: ping until configured, and notice a server that went quiet.

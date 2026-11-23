@@ -130,6 +130,16 @@ struct Inner {
     plasmo: Option<Plasmo>,
     /// Plasmo Voice's largest audio packet, from its config.
     plasmo_mtu: usize,
+    /// The server runs Plasmo Voice (it registered its channel).
+    plasmo_server: bool,
+    /// We registered Plasmo Voice's channels back: done only while voice chat is on.
+    plasmo_registered: bool,
+    /// Voice chat was switched back on: introduce ourselves once a key is ready, as the server
+    /// only asks when a player joins (and when a connection times out).
+    plasmo_resume: bool,
+    /// The key pair of the Plasmo Voice connection under way: a fresh one for each, dropped
+    /// with it.
+    plasmo_key: Option<plasmo::KeyPair>,
     /// Our own player, as the game says: Plasmo Voice never names it (SVC's secret does).
     me: Option<Uuid>,
     mixer: Mixer,
@@ -227,6 +237,10 @@ impl VoiceClient {
             session: Session::new(),
             plasmo: None,
             plasmo_mtu: 1024,
+            plasmo_server: false,
+            plasmo_registered: false,
+            plasmo_resume: false,
+            plasmo_key: None,
             me: None,
             mixer: Mixer::new(48.0),
             outbox: Vec::new(),
@@ -274,15 +288,23 @@ impl VoiceClient {
             let channels = plugin::decode_register(data);
             // A Plasmo Voice server: say we have the mod, and it asks for our player info.
             if channels.iter().any(|c| c == plasmo::CHANNEL) {
-                inner.plasmo.get_or_insert_with(Plasmo::new);
-                inner.outbox.push((plugin::MINECRAFT_REGISTER, plugin::encode_register(&[plasmo::CHANNEL, plasmo::INSTALLED])));
+                inner.plasmo_server = true;
+                plasmo_register(&mut inner);
             }
             inner.session.on_server_register(&channels, now)
         } else if channel == plasmo::CHANNEL {
-            let p = inner.plasmo.get_or_insert_with(Plasmo::new);
-            (p.voice_disabled, p.mic_muted) = (false, false);
-            let todo = p.on_tcp(data, plasmo_key(), game_host, now);
-            run_plasmo(&mut inner, todo);
+            // Voice chat off: nothing is negotiated or answered (the server asks again later).
+            if !inner.session.disabled {
+                if inner.plasmo_key.is_none() {
+                    inner.plasmo_key = plasmo_key_take();
+                }
+                let muted = inner.muted;
+                let Inner { plasmo, plasmo_key, .. } = &mut *inner;
+                let p = plasmo.get_or_insert_with(Plasmo::new);
+                (p.voice_disabled, p.mic_muted) = (false, muted);
+                let todo = p.on_tcp(data, plasmo_key.as_ref(), game_host, now);
+                run_plasmo(&mut inner, todo);
+            }
             vec![]
         } else {
             match ServerMessage::decode(channel, data) {
@@ -340,7 +362,9 @@ impl VoiceClient {
         inner.mixer.set_listener(listener);
         inner.mixer.set_positions(players);
         inner.ptt_down = ptt_down;
-        inner.whisper_down = whisper_down;
+        // Plasmo Voice has no whisper: the key does nothing there, and nothing says Whispering.
+        inner.whisper_down = whisper_down && inner.plasmo.is_none() && !inner.plasmo_server;
+        plasmo_resume(&mut inner);
     }
 
     /// Our own player, from the game.
@@ -377,7 +401,16 @@ impl VoiceClient {
         let actions = inner.session.set_disabled(disabled);
         inner.mixer.deafened = disabled || inner.deafened;
         run_actions(&mut inner, actions);
-        plasmo_state(&mut inner);
+        if disabled {
+            inner.plasmo_resume = false;
+            plasmo_drop(&mut inner);
+        } else if inner.plasmo_server && inner.plasmo.is_none() {
+            // The channels first if we never registered them, then our info, unasked: the server
+            // may have stopped asking.
+            plasmo_register(&mut inner);
+            inner.plasmo_resume = true;
+            plasmo_resume(&mut inner);
+        }
     }
 
     /// Makes a group of this type and joins it (`create_group`, captures 06 and 07).
@@ -496,6 +529,10 @@ impl VoiceClient {
         let mut inner = self.shared.lock();
         inner.session.reset();
         inner.plasmo = None;
+        inner.plasmo_key = None;
+        inner.plasmo_server = false;
+        inner.plasmo_registered = false;
+        inner.plasmo_resume = false;
         inner.reset_capture();
         inner.socket = None;
         inner.target = None;
@@ -614,20 +651,79 @@ fn run_actions(inner: &mut Inner, actions: Vec<Action>) {
 
 // --- Plasmo Voice ------------------------------------------------------------------------------
 
-/// The RSA key pair Plasmo Voice servers seal the audio key with: made once, in the background,
-/// as a 2048-bit key takes a moment. Until it's ready the server's request waits (it repeats it).
-static PLASMO_KEY: std::sync::OnceLock<Option<plasmo::KeyPair>> = std::sync::OnceLock::new();
+/// The next RSA key pair a Plasmo Voice server seals the audio key with, made ahead in the
+/// background (a 2048-bit key takes a moment). Each connection takes its own, never used again;
+/// until one is ready the server's request waits (it repeats it).
+static PLASMO_NEXT_KEY: Mutex<Option<plasmo::KeyPair>> = Mutex::new(None);
+static PLASMO_KEY_MAKING: AtomicBool = AtomicBool::new(false);
 
+/// Starts making the next key, unless one is ready or on its way.
 fn plasmo_key_start() {
-    if PLASMO_KEY.get().is_none() {
-        let _ = std::thread::Builder::new().name("earshot-key".into()).spawn(|| {
-            PLASMO_KEY.get_or_init(|| plasmo::KeyPair::generate(2048).map_err(|e| eprintln!("[earshot] no Plasmo Voice key: {e}")).ok());
-        });
+    if PLASMO_NEXT_KEY.lock().map_or(true, |k| k.is_some()) || PLASMO_KEY_MAKING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let made = std::thread::Builder::new().name("earshot-key".into()).spawn(|| {
+        match plasmo::KeyPair::generate(2048) {
+            Ok(key) => {
+                if let Ok(mut next) = PLASMO_NEXT_KEY.lock() {
+                    *next = Some(key);
+                }
+            }
+            Err(e) => eprintln!("[earshot] no Plasmo Voice key: {e}"),
+        }
+        PLASMO_KEY_MAKING.store(false, Ordering::Release);
+    });
+    if made.is_err() {
+        PLASMO_KEY_MAKING.store(false, Ordering::Release);
     }
 }
 
-fn plasmo_key() -> Option<&'static plasmo::KeyPair> {
-    PLASMO_KEY.get().and_then(Option::as_ref)
+/// A key for one connection, if one is ready, and the next one started.
+fn plasmo_key_take() -> Option<plasmo::KeyPair> {
+    let key = PLASMO_NEXT_KEY.lock().ok().and_then(|mut next| next.take());
+    plasmo_key_start();
+    key
+}
+
+/// Registers Plasmo Voice's channels back, which makes the server ask for our player info: only
+/// on a Plasmo Voice server, once, and while voice chat is on.
+fn plasmo_register(inner: &mut Inner) {
+    if inner.plasmo_server && !inner.plasmo_registered && !inner.session.disabled {
+        inner.plasmo_registered = true;
+        inner.outbox.push((plugin::MINECRAFT_REGISTER, plugin::encode_register(&[plasmo::CHANNEL, plasmo::INSTALLED])));
+    }
+}
+
+/// Introduces us to the Plasmo Voice server after voice chat was switched back on, with a new
+/// key, once one is ready (tried each tick until then).
+fn plasmo_resume(inner: &mut Inner) {
+    if !inner.plasmo_resume || inner.session.disabled || inner.plasmo.is_some() {
+        return;
+    }
+    let Some(key) = plasmo_key_take() else { return };
+    inner.plasmo_resume = false;
+    let mut p = Plasmo::new();
+    p.mic_muted = inner.muted;
+    let todo = p.introduce(&key);
+    inner.plasmo = Some(p);
+    inner.plasmo_key = Some(key);
+    run_plasmo(inner, todo);
+}
+
+/// Voice chat off on a Plasmo Voice server: the connection, its key, its address and socket and
+/// anything not yet sent to it are dropped, so nothing more goes out. Turned on again, the next
+/// request from the server starts a new connection with a new key.
+fn plasmo_drop(inner: &mut Inner) {
+    if inner.plasmo.take().is_none() {
+        return;
+    }
+    inner.plasmo_key = None;
+    inner.outbox.retain(|(channel, _)| *channel != plasmo::CHANNEL);
+    inner.socket = None;
+    inner.target = None;
+    inner.encoder = None;
+    inner.transmitting = false;
+    inner.reset_capture();
 }
 
 /// Our mute and voice-off state, for a Plasmo Voice server.
@@ -679,7 +775,10 @@ fn run_plasmo(inner: &mut Inner, todo: Vec<plasmo::Do>) {
             }
             plasmo::Do::Lost(why) => {
                 eprintln!("[earshot] voice: {why}");
+                // The next connection gets a new key, and the address the server gives then.
                 inner.socket = None;
+                inner.target = None;
+                inner.plasmo_key = None;
                 inner.reset_capture();
             }
         }
@@ -1247,7 +1346,7 @@ mod tests {
 
         // 2. Asked for our info (once the key is made), we send the public key.
         let deadline = Instant::now() + Duration::from_secs(60);
-        while plasmo_key().is_none() {
+        while PLASMO_NEXT_KEY.lock().unwrap().is_none() {
             assert!(Instant::now() < deadline, "no key");
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -1287,8 +1386,59 @@ mod tests {
         client.set_muted(true);
         assert_eq!(client.take_outgoing(), [(plasmo::CHANNEL, plasmo::player_state(false, true))]);
 
+        // 7. Voice chat off: the connection and anything queued for it are dropped, and the
+        // server's requests go unanswered.
+        client.set_muted(false);
+        client.set_disabled(true);
+        assert!(client.take_outgoing().is_empty(), "queued state dropped, nothing new");
+        assert!(!client.status().connected);
+        {
+            let inner = client.shared.lock();
+            assert!(inner.socket.is_none() && inner.target.is_none() && inner.plasmo_key.is_none());
+        }
+        client.on_plugin(plasmo::CHANNEL, &fake::request(), "127.0.0.1");
+        assert!(client.take_outgoing().is_empty(), "no reply while off");
+        assert!(client.shared.lock().plasmo.is_none());
+
+        // 8. On again: we introduce ourselves unasked (the server only asks on join), with a new key.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while PLASMO_NEXT_KEY.lock().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "no second key");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        client.set_disabled(false);
+        let out = client.take_outgoing();
+        assert_eq!(out.len(), 1);
+        assert_ne!(fake::public_key_of(&out[0].1), public, "a fresh key for each connection");
+
         client.disconnect();
         assert!(!client.status().connected);
+    }
+
+    #[test]
+    fn voice_off_never_starts_plasmo_voice() {
+        let client = VoiceClient::new(Settings { use_audio_devices: false, ..Settings::default() });
+        client.set_disabled(true);
+        client.take_outgoing();
+        client.on_plugin(plugin::MINECRAFT_REGISTER, &plugin::encode_register(&[plasmo::CHANNEL]), "127.0.0.1");
+        assert!(client.take_outgoing().is_empty(), "not registered while off");
+        client.on_plugin(plasmo::CHANNEL, &plasmo::fake_server::request(), "127.0.0.1");
+        assert!(client.take_outgoing().is_empty());
+        assert!(client.shared.lock().plasmo.is_none());
+        // Turned on, it registers, and the server's next request starts the connection.
+        client.set_disabled(false);
+        assert!(client.take_outgoing().contains(&(plugin::MINECRAFT_REGISTER, plugin::encode_register(&[plasmo::CHANNEL, plasmo::INSTALLED]))));
+    }
+
+    #[test]
+    fn no_whisper_on_plasmo_voice() {
+        let client = VoiceClient::new(Settings { use_audio_devices: false, ..Settings::default() });
+        client.tick(None, vec![], false, true);
+        assert!(client.shared.lock().whisper_down, "SVC: the whisper key works");
+        client.on_plugin(plugin::MINECRAFT_REGISTER, &plugin::encode_register(&[plasmo::CHANNEL]), "127.0.0.1");
+        client.tick(None, vec![], false, true);
+        assert!(!client.shared.lock().whisper_down, "Plasmo Voice: it does nothing");
+        assert!(!client.status().whispering);
     }
 
     #[test]

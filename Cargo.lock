@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "earshot-core"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "aes",
  "cpal",
@@ -511,7 +511,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mod-earshot"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "earshot-core",
  "horizon-mod-api",

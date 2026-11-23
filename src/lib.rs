@@ -21,8 +21,11 @@ use client::ID;
 
 /// One font pixel of a name tag, in blocks.
 const TAG_UNIT: f32 = 0.025;
-/// A white texture the icon's lines are drawn with, tinted.
-const WHITE: &str = "minecraft:block/white_concrete";
+/// A white texture the icon's lines are drawn with, tinted. Named without `minecraft:`: the
+/// draw context doesn't find sprites named with it, and nothing was drawn.
+const WHITE: &str = "block/white_concrete";
+/// Full sky and block light (as `BlockEntityDrawContext::light` has them), as the tag is drawn.
+const FULL_BRIGHT: u32 = 0xf0f0;
 
 #[derive(Default)]
 struct Earshot;
@@ -83,23 +86,26 @@ impl Hooks for Earshot {
         // The tag hangs half a block over the head; its text's middle 4 font pixels below its top.
         let height = if event.player.baby { 0.9 } else { 1.8 };
         draw.push();
+        draw.set_light(FULL_BRIGHT);
         draw.translate([0.0, height + 0.5 - 4.0 * TAG_UNIT, 0.0]);
         // The pose turns with the body (+z the way it faces); face the camera instead.
         draw.rotate_about([0.0, 1.0, 0.0], event.player.body_yaw - camera.yaw - 180.0, [0.0; 3]);
         // Past the tag's right end: half its width, then the icon's half width and a gap.
         let offset = (name_w / 2.0 + 9.0) * TAG_UNIT;
         for (a, b) in lines {
-            let p = |q: [f32; 2]| [-(offset + q[0] * TAG_UNIT), -q[1] * TAG_UNIT];
+            // +x is the viewer's right once turned; font y runs down.
+            let p = |q: [f32; 2]| [offset + q[0] * TAG_UNIT, -q[1] * TAG_UNIT];
             let (pa, pb) = (p(a), p(b));
             // A line two font pixels wide: a thin quad across it.
             let (dx, dy) = (pb[0] - pa[0], pb[1] - pa[1]);
             let len = (dx * dx + dy * dy).sqrt().max(1e-6);
             let (nx, ny) = (-dy / len * TAG_UNIT, dx / len * TAG_UNIT);
+            // In this order the quad's front faces the camera (it is one-sided).
             let corners = [
-                [pa[0] + nx, pa[1] + ny, 0.0],
-                [pb[0] + nx, pb[1] + ny, 0.0],
-                [pb[0] - nx, pb[1] - ny, 0.0],
                 [pa[0] - nx, pa[1] - ny, 0.0],
+                [pb[0] - nx, pb[1] - ny, 0.0],
+                [pb[0] + nx, pb[1] + ny, 0.0],
+                [pa[0] + nx, pa[1] + ny, 0.0],
             ];
             draw.quad(WHITE, corners, [0.0, 0.0, 1.0, 1.0], argb);
         }
