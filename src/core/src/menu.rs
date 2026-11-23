@@ -9,6 +9,7 @@
 
 use crate::plugin::GroupType;
 use crate::ui::{Draw, lock_icon};
+use crate::engine::GroupEvent;
 use crate::wire::Uuid;
 
 /// What a click, drag or key in the menu asks for. Moving between screens is the menu's own
@@ -351,21 +352,17 @@ impl Menu {
         }
     }
 
-    /// The group form shown, if any: `Some(None)` for creating a group, `Some(Some(id))` for the
-    /// password of group `id`. Only these pages follow the server's group changes.
-    pub fn group_form(&self) -> Option<Option<Uuid>> {
-        match self.page {
-            Page::CreateGroup => Some(None),
-            Page::Password(id) => Some(Some(id)),
-            _ => None,
-        }
-    }
-
-    /// Apply a server-side group change to the stored page and its keyboard focus.
-    pub fn sync_group(&mut self, in_group: bool, group_exists: impl FnOnce(Uuid) -> bool) {
-        let page = self.group_page(in_group, group_exists);
-        if page != self.page {
-            self.go(page);
+    /// A group change the server confirmed: a create or password form gives way to the group
+    /// list once we've joined, and a password form once its own group is removed. Any other page
+    /// or group is left alone.
+    pub fn on_group_event(&mut self, event: GroupEvent) {
+        let leave = match (self.page, event) {
+            (Page::CreateGroup | Page::Password(_), GroupEvent::Joined(_)) => true,
+            (Page::Password(shown), GroupEvent::Removed(id)) => shown == id,
+            _ => false,
+        };
+        if leave {
+            self.go(Page::Groups);
         }
     }
 
@@ -1063,16 +1060,21 @@ mod tests {
     }
 
     #[test]
-    fn only_the_group_forms_follow_group_updates() {
+    fn only_a_confirmed_change_of_the_shown_group_moves_a_form() {
+        let (shown, other) = (Uuid([3; 16]), Uuid([4; 16]));
         let mut menu = Menu::new();
-        assert_eq!(menu.group_form(), None, "the main page ignores group updates");
-        menu.go(Page::Groups);
-        assert_eq!(menu.group_form(), None);
+        menu.on_group_event(GroupEvent::Joined(shown));
+        assert_eq!(menu.page, Page::Main, "the main page ignores group changes");
+        menu.go(Page::Password(shown));
+        menu.on_group_event(GroupEvent::Removed(other));
+        assert_eq!(menu.page, Page::Password(shown), "another group's removal leaves the form");
+        menu.on_group_event(GroupEvent::Removed(shown));
+        assert_eq!(menu.page, Page::Groups);
         menu.go(Page::CreateGroup);
-        assert_eq!(menu.group_form(), Some(None));
-        let id = Uuid([3; 16]);
-        menu.go(Page::Password(id));
-        assert_eq!(menu.group_form(), Some(Some(id)));
+        menu.on_group_event(GroupEvent::Removed(other));
+        assert_eq!(menu.page, Page::CreateGroup);
+        menu.on_group_event(GroupEvent::Joined(other));
+        assert_eq!(menu.page, Page::Groups);
     }
 
     #[test]
@@ -1117,13 +1119,12 @@ mod tests {
         let mut wrong = m.clone();
         wrong.group_problem = Some("wrong password".into());
         assert!(texts(&menu.draw(&wrong, GUI, [0.0; 2], &width)).iter().any(|t| t.contains("wrong password")));
-        menu.sync_group(false, |_| true);
+        // A rejected password joins nothing: no event, and the field stays editable.
         assert!(menu.typing(), "a rejected password can still be edited");
-        menu.sync_group(true, |_| true);
+        menu.on_group_event(GroupEvent::Joined(Uuid([9; 16])));
         assert_eq!(menu.page(&in_group()), Page::Groups);
         assert!(!menu.typing(), "the hidden password field must release keyboard focus");
         assert_eq!(menu.key(MenuKey::Enter), None);
-        menu.sync_group(false, |_| true);
         assert_eq!(menu.page(&m), Page::Groups, "leaving the group stays on the group list");
     }
 

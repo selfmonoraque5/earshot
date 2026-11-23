@@ -249,9 +249,12 @@ impl VoiceClient {
 
     /// A custom payload from the server, any channel. `game_host` is the host the player joined,
     /// used when the server's `voice_host` doesn't name one.
-    pub fn on_plugin(&self, channel: &str, data: &[u8], game_host: &str) {
+    /// Applies a voice chat message from the server; returns the group change it applied, if
+    /// any, for the voice menu.
+    pub fn on_plugin(&self, channel: &str, data: &[u8], game_host: &str) -> Option<GroupEvent> {
         let now = self.shared.now();
         let mut inner = self.shared.lock();
+        let mut event = None;
         let actions = if channel == plugin::MINECRAFT_REGISTER {
             inner.session.on_server_register(&plugin::decode_register(data), now)
         } else {
@@ -281,11 +284,13 @@ impl VoiceClient {
                 }
                 Some(Ok(ServerMessage::RemoveGroup(id))) => {
                     inner.groups.retain(|x| x.id != id);
+                    event = Some(GroupEvent::Removed(id));
                     vec![]
                 }
                 Some(Ok(ServerMessage::JoinedGroup(j))) => {
                     inner.my_group = j.group;
                     inner.group_problem = j.wrong_password.then(|| "wrong password".to_string());
+                    event = j.group.map(GroupEvent::Joined);
                     vec![]
                 }
                 Some(Err(e)) => {
@@ -298,6 +303,7 @@ impl VoiceClient {
         };
         run_actions(&mut inner, actions);
         chime_on_group_change(&mut inner);
+        event
     }
 
     /// Once a game tick: where we listen from, where the other players are, and the
@@ -386,14 +392,6 @@ impl VoiceClient {
         inner.settings = settings;
     }
 
-    /// Whether this client is in a group, and whether `group` is one the server listed: two
-    /// direct reads for the menu, without building a `Status`.
-    pub fn group_state(&self, group: Option<Uuid>) -> (bool, bool) {
-        let inner = self.shared.lock();
-        let listed = group.is_some_and(|id| inner.groups.iter().any(|g| g.id == id));
-        (inner.my_group.is_some(), listed)
-    }
-
     pub fn status(&self) -> Status {
         let inner = self.shared.lock();
         let connection = match &inner.session.phase {
@@ -462,6 +460,13 @@ impl VoiceClient {
 }
 
 /// Our group and its other members, from the server's states (sorted, so order never counts).
+/// A group change the server confirmed: we joined `Joined`'s group, or `Removed`'s group is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupEvent {
+    Joined(Uuid),
+    Removed(Uuid),
+}
+
 fn group_view(inner: &Inner) -> crate::chime::GroupView {
     let group = inner.my_group?;
     let me = inner.session.player();
@@ -1076,12 +1081,15 @@ mod tests {
         assert_eq!(s.groups[0].members, [(Uuid::parse("c5c602ae-651d-3857-9a04-b3e776be1219").unwrap(), "NullPort404".to_string())]);
         assert!(s.my_group.is_none());
 
-        client.on_plugin(plugin::JOINED_GROUP, &from_hex("01 453d1ee3061047f2bfb227f017fc5782 00"), "h");
+        let joined = client.on_plugin(plugin::JOINED_GROUP, &from_hex("01 453d1ee3061047f2bfb227f017fc5782 00"), "h");
+        assert_eq!(joined, Some(GroupEvent::Joined(group)));
         assert_eq!(client.status().my_group.map(|g| g.id), Some(group));
 
         // Leaving: joined_group 00 00, then the group goes away.
-        client.on_plugin(plugin::JOINED_GROUP, &from_hex("0000"), "h");
-        client.on_plugin(plugin::REMOVE_GROUP, &from_hex("453d1ee3061047f2bfb227f017fc5782"), "h");
+        assert_eq!(client.on_plugin(plugin::JOINED_GROUP, &from_hex("0000"), "h"), None);
+        let removed = client.on_plugin(plugin::REMOVE_GROUP, &from_hex("453d1ee3061047f2bfb227f017fc5782"), "h");
+        assert_eq!(removed, Some(GroupEvent::Removed(group)));
+        assert_eq!(client.on_plugin(plugin::REMOVE_GROUP, &[1, 2], "h"), None, "an unreadable message changes nothing");
         let s = client.status();
         assert!(s.my_group.is_none() && s.groups.is_empty());
 

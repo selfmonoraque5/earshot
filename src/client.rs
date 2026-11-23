@@ -252,17 +252,13 @@ pub fn plugin_message(host: &mut dyn ClientHost, channel: &str, data: &[u8], ser
         return;
     }
     let host_name = host_of(server);
-    let group_update = matches!(channel, plugin::JOINED_GROUP | plugin::ADD_GROUP | plugin::REMOVE_GROUP);
     let menu_open = host.mod_screen() == Some(ID);
     with_state(&*host, |s| {
-        s.client.on_plugin(channel, data, &host_name);
-        // Only an open create or password page moves on a group update, with two direct reads.
-        if group_update
+        // A confirmed join or group removal moves the open menu's form; nothing is scanned.
+        if let Some(event) = s.client.on_plugin(channel, data, &host_name)
             && menu_open
-            && let Some(form) = s.menu.group_form()
         {
-            let (in_group, listed) = s.client.group_state(form);
-            s.menu.sync_group(in_group, |_| listed);
+            s.menu.on_group_event(event);
         }
     });
     flush(host);
