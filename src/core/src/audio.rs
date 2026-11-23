@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
@@ -25,6 +25,7 @@ pub type CaptureQueue = Arc<Mutex<VecDeque<f32>>>;
 pub type PlaybackQueue = Arc<Mutex<VecDeque<[f32; 2]>>>;
 
 const CAPTURE_LIMIT: usize = SAMPLE_RATE as usize;
+const DEVICE_RETRY: Duration = Duration::from_secs(1);
 
 /// Names of the input devices, for the settings page.
 pub fn input_devices() -> Vec<String> {
@@ -66,27 +67,34 @@ impl AudioIo {
             .spawn(move || {
                 let mut current = None;
                 let mut stream = None;
+                let mut retry_at = Instant::now();
                 while !stopping.load(Ordering::Relaxed) {
                     let next = wanted();
                     if next != current {
                         drop(stream.take());
                         current = next;
+                        retry_at = Instant::now();
                         status("closed".into());
-                        if let Some(device) = &current {
-                            // Built paused: the player may mute, disconnect or change devices
-                            // while it opens.
-                            let opened = open(&cpal::default_host(), device);
-                            if stopping.load(Ordering::Relaxed) {
-                                break;
+                    }
+                    if stream.is_none()
+                        && let Some(device) = &current
+                        && Instant::now() >= retry_at
+                    {
+                        // Built paused: the player may mute, disconnect or change devices while it opens.
+                        let opened = open(&cpal::default_host(), device);
+                        if stopping.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        match opened.and_then(|(name, handle)| Ok((start(device, &handle)?, name, handle))) {
+                            Ok((true, name, handle)) => {
+                                stream = Some(handle);
+                                status(name);
                             }
-                            match opened.and_then(|(name, handle)| Ok((start(device, &handle)?, name, handle))) {
-                                Ok((true, name, handle)) => {
-                                    stream = Some(handle);
-                                    status(name);
-                                }
-                                // No longer wanted: dropped unstarted; the next round sees the new request.
-                                Ok((false, ..)) => current = None,
-                                Err(e) => status(format!("none ({e})")),
+                            // No longer wanted: dropped unstarted; the next round sees the new request.
+                            Ok((false, ..)) => current = None,
+                            Err(e) => {
+                                retry_at = Instant::now() + DEVICE_RETRY;
+                                status(format!("none ({e})"));
                             }
                         }
                     }
@@ -248,4 +256,27 @@ where
             None,
         )
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retries_a_device_that_failed_to_open() {
+        let (attempts, received) = std::sync::mpsc::channel();
+        let _audio = AudioIo::start(
+            "earshot-test-device",
+            || Some(()),
+            move |_, _| {
+                attempts.send(Instant::now()).unwrap();
+                Err("device temporarily unavailable".into())
+            },
+            |_, _| panic!("opening the test device always fails"),
+            |_| {},
+        );
+        let first = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(second.duration_since(first) >= DEVICE_RETRY);
+    }
 }

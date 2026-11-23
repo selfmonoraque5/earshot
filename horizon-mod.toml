@@ -14,7 +14,7 @@ capabilities = ["registries"]
 
 [native]
 game = "26.3"
-horizon = "f037744a79f9982c47876f49c5a3067279f88706"
+horizon = "f1bb66f353cf67f2aa4665293fc75c8d91186fc7"
 mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"
 
 # No game patch in this version: the voice server's patch broke with Horizon's gameplay split

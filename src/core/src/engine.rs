@@ -159,7 +159,7 @@ struct Inner {
 
 impl Inner {
     fn audio_devices(&self) -> (Option<Option<String>>, Option<Option<String>>) {
-        let voice = self.target.is_some();
+        let voice = matches!(self.session.phase, Phase::Authenticating { .. } | Phase::Checking { .. } | Phase::Connected { .. });
         let test = self.mic_test && !self.muted;
         let active = self.settings.use_audio_devices && !self.session.disabled && (voice || test);
         let input = (active && !self.muted).then(|| self.settings.input_device.clone());
@@ -444,8 +444,9 @@ impl VoiceClient {
         inner.group_problem = None;
         // Leaving the server isn't leaving the group: no chime.
         inner.group_view = None;
-        let max = 48.0;
-        inner.mixer = Mixer::new(max);
+        let player_volume = std::mem::take(&mut inner.mixer.player_volume);
+        inner.mixer = Mixer::new(48.0);
+        inner.mixer.player_volume = player_volume;
         inner.mixer.volume = inner.settings.output_volume;
         inner.mixer.group_volume = inner.settings.group_volume.max(0.0);
         inner.mixer.deafened = inner.deafened || inner.session.disabled;
@@ -534,6 +535,7 @@ fn run_actions(inner: &mut Inner, actions: Vec<Action>) {
             Action::Lost(why) => {
                 eprintln!("[earshot] voice: {why}");
                 inner.socket = None;
+                inner.reset_capture();
             }
         }
     }
@@ -662,6 +664,11 @@ fn worker(shared: Arc<Shared>) {
                     drop(inner);
                     let opened = open_socket(&host, port);
                     inner = shared.lock();
+                    if !matches!(inner.session.phase, Phase::Authenticating { .. })
+                        || !inner.target.as_ref().is_some_and(|(h, p)| *h == host && *p == port)
+                    {
+                        continue;
+                    }
                     match opened {
                         Ok(s) => {
                             eprintln!("[earshot] voice server: udp {host}:{port}, from {:?}", s.local_addr());
@@ -834,7 +841,7 @@ mod tests {
     fn audio_devices_follow_mute_and_voice_chat() {
         let client = VoiceClient::new(Settings { use_audio_devices: false, ..Settings::default() });
         let mut inner = client.shared.lock();
-        inner.target = Some(("127.0.0.1".into(), 1));
+        inner.session.phase = Phase::Connected { last_heard: 0 };
         assert_eq!(inner.audio_devices(), (None, None));
         inner.settings.use_audio_devices = true;
         assert_eq!(inner.audio_devices(), (Some(None), Some(None)));
@@ -847,7 +854,7 @@ mod tests {
         inner.session.disabled = false;
         assert_eq!(inner.audio_devices(), (Some(None), Some(None)));
 
-        inner.target = None;
+        inner.session.reset();
         assert_eq!(inner.audio_devices(), (None, None));
         inner.mic_test = true;
         assert_eq!(inner.audio_devices(), (Some(None), Some(None)));
@@ -860,10 +867,40 @@ mod tests {
     }
 
     #[test]
+    fn voice_timeout_stops_audio_without_disabling_the_mic_test() {
+        let client = VoiceClient::new(Settings { use_audio_devices: false, ..Settings::default() });
+        let mut inner = client.shared.lock();
+        inner.settings.use_audio_devices = true;
+        inner.target = Some(("127.0.0.1".into(), 1));
+        inner.session.phase = Phase::Authenticating { since: 0, last_sent: 0 };
+        let before = inner.capture.clone();
+        assert_eq!(inner.audio_devices(), (Some(None), Some(None)));
+
+        let actions = inner.session.poll(15_000);
+        run_actions(&mut inner, actions);
+        assert!(matches!(inner.session.phase, Phase::Failed(_)));
+        assert_eq!(inner.audio_devices(), (None, None));
+        assert!(!Arc::ptr_eq(&before, &inner.capture));
+
+        inner.mic_test = true;
+        assert_eq!(inner.audio_devices(), (Some(None), Some(None)));
+        inner.settings.use_audio_devices = false;
+    }
+
+    #[test]
+    fn player_volume_survives_leaving_a_server() {
+        let client = VoiceClient::new(Settings { use_audio_devices: false, ..Settings::default() });
+        let player = Uuid([1; 16]);
+        client.set_player_volume(player, 0.0);
+        client.disconnect();
+        assert_eq!(client.shared.lock().mixer.player_volume.get(&player), Some(&0.0));
+    }
+
+    #[test]
     fn a_microphone_opened_as_the_player_mutes_is_never_started() {
         let client = VoiceClient::new(Settings { use_audio_devices: false, ..Settings::default() });
         let mut inner = client.shared.lock();
-        inner.target = Some(("127.0.0.1".into(), 1));
+        inner.session.phase = Phase::Connected { last_heard: 0 };
         inner.settings.use_audio_devices = true;
         // The worker read this request, then opened the device while the player muted.
         let opening = inner.wanted_input().unwrap();
@@ -883,7 +920,7 @@ mod tests {
         let fresh = inner.wanted_input().unwrap();
         assert_eq!(audio::start_if_wanted(&fresh, inner.wanted_input(), || Ok(())), Ok(true));
         inner.settings.use_audio_devices = false;
-        inner.target = None;
+        inner.session.reset();
     }
 
     #[test]

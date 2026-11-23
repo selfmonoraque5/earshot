@@ -176,6 +176,7 @@ enum Kind {
 #[derive(Debug, Clone, PartialEq)]
 enum Id {
     Go(Page),
+    ListPage(usize),
     Back,
     Mute,
     Deafen,
@@ -271,6 +272,29 @@ impl Builder {
     fn space(&mut self, h: f32) {
         self.y += h;
     }
+
+    fn list(&mut self, gui_h: f32, fixed_rows: usize, page: usize, total: usize, mut row: impl FnMut(&mut Self, usize)) {
+        let mut room = list_room(gui_h, fixed_rows);
+        if total > room {
+            room = list_room(gui_h, fixed_rows + 1);
+        }
+        let last = total.saturating_sub(1) / room;
+        let page = page.min(last);
+        let start = page * room;
+        for i in start..(start + room).min(total) {
+            row(self, i);
+        }
+        if last > 0 {
+            let mut buttons = Vec::new();
+            if page > 0 {
+                buttons.push(Widget::new(Id::ListPage(page - 1), Kind::Button, "Previous page"));
+            }
+            if page < last {
+                buttons.push(Widget::new(Id::ListPage(page + 1), Kind::Button, "Next page"));
+            }
+            self.row(buttons);
+        }
+    }
 }
 
 fn inside(r: [f32; 4], p: [f32; 2]) -> bool {
@@ -292,13 +316,14 @@ fn list_room(gui_h: f32, other_rows: usize) -> usize {
 #[derive(Debug)]
 pub struct Menu {
     page: Page,
+    list_page: usize,
     dragging: Option<Id>,
     edit: Editing,
 }
 
 impl Default for Menu {
     fn default() -> Self {
-        Self { page: Page::Main, dragging: None, edit: Editing::default() }
+        Self { page: Page::Main, list_page: 0, dragging: None, edit: Editing::default() }
     }
 }
 
@@ -309,18 +334,28 @@ impl Menu {
 
     /// The menu was opened: start on the main screen, nothing focused.
     pub fn open(&mut self) {
-        self.page = Page::Main;
-        self.dragging = None;
-        self.edit.focus = None;
+        self.go(Page::Main);
     }
 
     /// The screen shown: a create or password screen gives way to the group once we're in one,
     /// and a password screen to the list once its group is gone.
     pub fn page(&self, m: &MenuModel) -> Page {
+        self.group_page(m.group.is_some(), |id| m.groups.iter().any(|g| g.0 == id))
+    }
+
+    fn group_page(&self, in_group: bool, group_exists: impl FnOnce(Uuid) -> bool) -> Page {
         match self.page {
-            Page::CreateGroup | Page::Password(_) if m.group.is_some() => Page::Groups,
-            Page::Password(id) if !m.groups.iter().any(|g| g.0 == id) => Page::Groups,
+            Page::CreateGroup | Page::Password(_) if in_group => Page::Groups,
+            Page::Password(id) if !group_exists(id) => Page::Groups,
             p => p,
+        }
+    }
+
+    /// Apply a server-side group change to the stored page and its keyboard focus.
+    pub fn sync_group(&mut self, in_group: bool, group_exists: impl FnOnce(Uuid) -> bool) {
+        let page = self.group_page(in_group, group_exists);
+        if page != self.page {
+            self.go(page);
         }
     }
 
@@ -407,14 +442,11 @@ impl Menu {
                 if m.players.is_empty() {
                     b.text("No players nearby", GREY);
                 }
-                let room = list_room(gui[1], 1);
-                for (id, name, volume, talking) in m.players.iter().take(room) {
+                b.list(gui[1], 1, self.list_page, m.players.len(), |b, i| {
+                    let (id, name, volume, talking) = &m.players[i];
                     let label = format!("{}{name}: {}", if *talking { "> " } else { "" }, pct(*volume));
                     b.row(vec![Widget::new(Id::Player(*id), Kind::Slider { min: 0.0, max: VOLUME_MAX, value: *volume }, label)]);
-                }
-                if m.players.len() > room {
-                    b.text(format!("and {} more", m.players.len() - room), GREY);
-                }
+                });
             }
             Page::Groups if m.group.is_some() => {
                 b.row(vec![Widget::new(
@@ -429,16 +461,13 @@ impl Menu {
                 )
                 .on(m.group_sounds)]);
                 b.text("Members", GREY);
-                let room = list_room(gui[1], 4);
-                for (id, name, talking) in m.group_members.iter().take(room) {
+                b.list(gui[1], 4, self.list_page, m.group_members.len(), |b, i| {
+                    let (id, name, talking) = &m.group_members[i];
                     let mut w = Widget::new(Id::Member(*id), Kind::Label, if *talking { format!("{name}  (talking)") } else { name.clone() });
                     w.on = *talking;
                     w.avatar = Some(*id);
                     b.row(vec![w]);
-                }
-                if m.group_members.len() > room {
-                    b.text(format!("and {} more", m.group_members.len() - room), GREY);
-                }
+                });
                 b.row(vec![Widget::new(Id::Leave, Kind::Button, "Leave group").alert(true)]);
             }
             Page::Groups => {
@@ -449,15 +478,12 @@ impl Menu {
                 if others.is_empty() {
                     b.text("No groups yet", GREY);
                 }
-                let room = list_room(gui[1], 2);
-                for (id, name, has_password, members, _) in others.iter().take(room) {
+                b.list(gui[1], 2, self.list_page, others.len(), |b, i| {
+                    let (id, name, has_password, members, _) = others[i];
                     let mut w = Widget::new(Id::Group(*id), Kind::Button, format!("{name} ({members})"));
                     w.lock = *has_password;
                     b.row(vec![w]);
-                }
-                if others.len() > room {
-                    b.text(format!("and {} more", others.len() - room), GREY);
-                }
+                });
                 b.row(vec![Widget::new(Id::Go(Page::CreateGroup), Kind::Button, "Create group")]);
             }
             Page::CreateGroup => {
@@ -604,6 +630,10 @@ impl Menu {
                 self.go(target);
                 None
             }
+            Id::ListPage(page) => {
+                self.list_page = page;
+                None
+            }
             Id::Back => {
                 self.go(page.parent());
                 None
@@ -649,13 +679,12 @@ impl Menu {
 
     fn go(&mut self, page: Page) {
         self.page = page;
+        self.list_page = 0;
         self.dragging = None;
+        self.edit.join_password.clear();
         self.edit.focus = match page {
             Page::CreateGroup => Some(Field::NewName),
-            Page::Password(_) => {
-                self.edit.join_password.clear();
-                Some(Field::JoinPassword)
-            }
+            Page::Password(_) => Some(Field::JoinPassword),
             _ => None,
         };
     }
@@ -1024,6 +1053,26 @@ mod tests {
     }
 
     #[test]
+    fn later_groups_and_players_are_selectable() {
+        let mut m = model();
+        m.groups = (1..=9).map(|i| (Uuid([i; 16]), format!("Group {i}"), false, 1, false)).collect();
+        m.players = (1..=9).map(|i| (Uuid([i; 16]), format!("Player {i}"), 1.0, false)).collect();
+        let last = Uuid([9; 16]);
+        let mut menu = Menu::new();
+
+        click(&mut menu, &m, Id::Go(Page::Groups));
+        click(&mut menu, &m, Id::ListPage(1));
+        assert_eq!(click(&mut menu, &m, Id::Group(last)), Some(MenuAction::JoinGroup(last, None)));
+        click(&mut menu, &m, Id::ListPage(0));
+        assert!(menu.layout(&m, GUI).widgets.iter().any(|w| w.id == Id::Group(Uuid([1; 16]))));
+
+        click(&mut menu, &m, Id::Back);
+        click(&mut menu, &m, Id::Go(Page::Players));
+        click(&mut menu, &m, Id::ListPage(1));
+        assert!(matches!(click(&mut menu, &m, Id::Player(last)), Some(MenuAction::SetPlayerVolume(id, _)) if id == last));
+    }
+
+    #[test]
     fn a_password_group_has_a_padlock_and_its_own_screen() {
         let m = model();
         let mut menu = Menu::new();
@@ -1045,8 +1094,14 @@ mod tests {
         let mut wrong = m.clone();
         wrong.group_problem = Some("wrong password".into());
         assert!(texts(&menu.draw(&wrong, GUI, [0.0; 2], &width)).iter().any(|t| t.contains("wrong password")));
-        // Once in, the screen becomes the group's.
+        menu.sync_group(false, |_| true);
+        assert!(menu.typing(), "a rejected password can still be edited");
+        menu.sync_group(true, |_| true);
         assert_eq!(menu.page(&in_group()), Page::Groups);
+        assert!(!menu.typing(), "the hidden password field must release keyboard focus");
+        assert_eq!(menu.key(MenuKey::Enter), None);
+        menu.sync_group(false, |_| true);
+        assert_eq!(menu.page(&m), Page::Groups, "leaving the group stays on the group list");
     }
 
     #[test]

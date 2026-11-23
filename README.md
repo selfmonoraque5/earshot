@@ -73,7 +73,7 @@ Earshot 1.x could host voice on a dedicated server and listened on UDP port 2445
 
 ## Install
 
-Made for Horizon **Nightly 2026-11-21 · f037744**.
+Made for Horizon **Nightly 2026-11-22 · f1bb66f**.
 It uses only the mod API, so the launcher also builds it on later Horizon builds where nothing it uses
 changed.
 

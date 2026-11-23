@@ -38,8 +38,8 @@ impl Hooks for Earshot {
         let _ = r.register_setting(SettingSpec::toggle(client::SETTING_DEBUG, format!("{ID}.option.debug"), false));
     }
 
-    fn setting_changed(&self, host: &mut dyn ClientHost, _: &mut SettingChangedEvent<'_>) {
-        client::page_changed(&*host);
+    fn setting_changed(&self, host: &mut dyn ClientHost, event: &mut SettingChangedEvent<'_>) {
+        client::page_changed(&*host, event.key);
         // Turning voice off or on is a message to the server.
         client::flush(host);
     }

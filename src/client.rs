@@ -252,7 +252,13 @@ pub fn plugin_message(host: &mut dyn ClientHost, channel: &str, data: &[u8], ser
         return;
     }
     let host_name = host_of(server);
-    with_state(&*host, |s| s.client.on_plugin(channel, data, &host_name));
+    with_state(&*host, |s| {
+        s.client.on_plugin(channel, data, &host_name);
+        if matches!(channel, plugin::JOINED_GROUP | plugin::ADD_GROUP | plugin::REMOVE_GROUP) {
+            let status = s.client.status();
+            s.menu.sync_group(status.my_group.is_some(), |id| status.groups.iter().any(|group| group.id == id));
+        }
+    });
     flush(host);
 }
 
@@ -354,13 +360,14 @@ pub fn tick(host: &mut dyn ClientHost) {
 }
 
 /// The settings page changed: voice on or off, debug info.
-pub fn page_changed(host: &dyn ClientHost) {
-    let disabled = !host.setting_bool(SETTING_VOICE).unwrap_or(true);
-    let debug = host.setting_bool(SETTING_DEBUG).unwrap_or(false);
-    with_state(host, |s| {
-        s.disabled = disabled;
-        s.client.set_disabled(disabled);
-        s.debug = debug;
+pub fn page_changed(host: &dyn ClientHost, key: &str) {
+    with_state(host, |s| match key {
+        SETTING_VOICE => {
+            s.disabled = !host.setting_bool(SETTING_VOICE).unwrap_or(true);
+            s.client.set_disabled(s.disabled);
+        }
+        SETTING_DEBUG => s.debug = host.setting_bool(SETTING_DEBUG).unwrap_or(false),
+        _ => {}
     });
 }
 
@@ -587,7 +594,7 @@ fn next_device(devices: Vec<String>, current: &Option<String>) -> Option<String>
 
 /// Applies a menu action. Returns whether it's a change worth saving now (sliders save when
 /// let go instead, so a drag doesn't write the settings dozens of times).
-fn apply(s: &mut State, action: MenuAction) -> bool {
+fn apply(host: &dyn Host, s: &mut State, action: MenuAction) -> bool {
     let mut settings_changed = true;
     let save_now = match action {
         MenuAction::ToggleMute => {
@@ -605,8 +612,9 @@ fn apply(s: &mut State, action: MenuAction) -> bool {
         MenuAction::ToggleVoiceChat => {
             s.disabled = !s.disabled;
             s.client.set_disabled(s.disabled);
+            host.set_setting(ID, SETTING_VOICE, if s.disabled { "false" } else { "true" });
             settings_changed = false;
-            true
+            false
         }
         MenuAction::ToggleMode => {
             s.settings.mode = match s.settings.mode {
@@ -712,7 +720,7 @@ pub fn screen_press(host: &dyn ClientHost, rect: [f32; 4], mouse: [f32; 2]) -> b
         let m = model(host, s);
         let inside = s.menu.contains(&m, size, mouse);
         if let Some(action) = s.menu.press(&m, size, mouse)
-            && apply(s, action)
+            && apply(host, s, action)
         {
             save(host, s);
         }
@@ -727,7 +735,7 @@ pub fn screen_drag(host: &dyn ClientHost, rect: [f32; 4], mouse: [f32; 2]) -> bo
         let m = model(host, s);
         match s.menu.drag(&m, size, mouse) {
             Some(action) => {
-                apply(s, action);
+                apply(host, s, action);
                 true
             }
             None => false,
@@ -774,7 +782,7 @@ pub fn screen_key(host: &dyn ClientHost, key: &str) -> bool {
         };
         if let Some(k) = menu_key
             && let Some(action) = s.menu.key(k)
-            && apply(s, action)
+            && apply(host, s, action)
         {
             save(host, s);
         }
@@ -798,6 +806,85 @@ pub fn screen_char(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mod_api::prelude::{ConfigClientHost, ConfigHost};
+    use mod_api::{ConfigEntry, ConfigFileError, ConfigFiles, ConfigStat};
+    use std::cell::Cell;
+
+    struct EmptyData;
+
+    impl ConfigFiles for EmptyData {
+        fn read(&self, _: &ConfigPath) -> Result<Vec<u8>, ConfigFileError> {
+            Ok(Vec::new())
+        }
+
+        fn write(&self, _: &ConfigPath, _: &[u8]) -> Result<(), ConfigFileError> {
+            unreachable!()
+        }
+
+        fn list(&self, _: &ConfigPath, _: Option<&str>, _: u32) -> Result<Vec<ConfigEntry>, ConfigFileError> {
+            unreachable!()
+        }
+
+        fn stat(&self, _: &ConfigPath) -> Result<Option<ConfigStat>, ConfigFileError> {
+            unreachable!()
+        }
+    }
+
+    struct SettingsHost {
+        voice: Cell<bool>,
+        debug: Cell<bool>,
+    }
+
+    impl Host for SettingsHost {}
+    mod_api::impl_host_areas!(SettingsHost, except(config));
+    impl ClientHost for SettingsHost {}
+    mod_api::impl_client_host_areas!(SettingsHost, except(config));
+
+    impl ConfigHost for SettingsHost {
+        fn data_files(&self) -> &'static dyn ConfigFiles {
+            &EmptyData
+        }
+
+        fn set_setting(&self, mod_id: &str, key: &str, value: &str) {
+            assert_eq!((mod_id, key), (ID, SETTING_VOICE));
+            self.voice.set(value.parse().unwrap());
+        }
+    }
+
+    impl ConfigClientHost for SettingsHost {
+        fn setting_bool(&self, key: &str) -> Option<bool> {
+            match key {
+                SETTING_VOICE => Some(self.voice.get()),
+                SETTING_DEBUG => Some(self.debug.get()),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn the_menu_and_mod_config_share_the_saved_voice_switch() {
+        let host = SettingsHost { voice: Cell::new(true), debug: Cell::new(false) };
+        let mut state = load(&host);
+        assert!(!state.client.status().disabled);
+        apply(&host, &mut state, MenuAction::ToggleVoiceChat);
+        assert!(state.client.status().disabled);
+        assert!(!host.voice.get());
+
+        let restarted = load(&host);
+        assert!(restarted.client.status().disabled);
+        STATE.with(|slot| *slot.borrow_mut() = Some(restarted));
+        host.debug.set(true);
+        page_changed(&host, SETTING_DEBUG);
+        with_existing(|s| {
+            assert!(s.debug);
+            assert!(s.client.status().disabled);
+        }).unwrap();
+
+        host.voice.set(true);
+        page_changed(&host, SETTING_VOICE);
+        assert_eq!(with_existing(|s| s.client.status().disabled), Some(false));
+        STATE.with(|slot| slot.borrow_mut().take());
+    }
 
     #[test]
     fn addresses_keys_and_payloads() {
