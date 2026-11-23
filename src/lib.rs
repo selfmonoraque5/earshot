@@ -74,7 +74,7 @@ impl Hooks for Earshot {
         if event.who.local {
             return;
         }
-        let Some((lines, argb)) = client::tag_icon(event.player.id) else { return };
+        let Some((lines, argb)) = client::tag_icon(event.player.id, event.who.name) else { return };
         let Some(camera) = host.camera() else { return };
         let draw = &mut *event.draw;
         let name_w = host

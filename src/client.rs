@@ -277,6 +277,28 @@ pub fn chat_line(host: &dyn ClientHost, message: &mut mod_api::Text) {
     *message = crate::text_json::from_json(&rewritten);
 }
 
+/// Players within this many blocks are looked up by name in the client's world.
+const NAME_LOOKUP_RANGE: f64 = 96.0;
+
+/// The players near the camera, by name, from the client's own world. A UUID lookup finds other
+/// players only where this game hosts the world, so on a remote server they're matched by the
+/// names the voice server gave.
+fn players_by_name(host: &dyn ClientHost) -> HashMap<String, mod_api::EntityRef> {
+    let reads: &dyn Host = host;
+    let (Some(camera), Some(level)) = (host.camera(), host.local_player().and_then(|p| p.entity().level(reads))) else {
+        return HashMap::new();
+    };
+    let [x, y, z] = camera.position;
+    let r = NAME_LOOKUP_RANGE;
+    level
+        .entities_in(reads, [x - r, y - r, z - r], [x + r, y + r, z + r])
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.kind(reads).is_some_and(|k| k.id(reads) == "minecraft:player"))
+        .filter_map(|e| Some((e.name(reads)?, e)))
+        .collect()
+}
+
 /// The players the voice client knows of: their entity, and where their voice comes from.
 fn players(host: &dyn ClientHost, status: &Status) -> Vec<(Uuid, u32, [f64; 3])> {
     let mut ids: Vec<Uuid> = status.has_voice.iter().chain(&status.voice_off).chain(&status.talking).copied().collect();
@@ -286,10 +308,15 @@ fn players(host: &dyn ClientHost, status: &Status) -> Vec<(Uuid, u32, [f64; 3])>
     ids.sort();
     ids.dedup();
     let reads: &dyn Host = host;
+    let names: HashMap<Uuid, &str> = status.names.iter().map(|(id, n)| (*id, n.as_str())).collect();
+    let mut by_name = None;
     ids.into_iter()
         .filter(|id| Some(*id) != status.me)
         .filter_map(|id| {
-            let entity = reads.player(u128::from_be_bytes(id.0))?.entity();
+            let entity = match reads.player(u128::from_be_bytes(id.0)) {
+                Some(p) => p.entity(),
+                None => *by_name.get_or_insert_with(|| players_by_name(host)).get(*names.get(&id)?)?,
+            };
             let pos = entity.position(reads)?;
             let height = entity.dimensions(reads).map_or(1.8, |d| d[1]);
             // Voices come from the head, not the feet.
@@ -306,7 +333,16 @@ pub fn tick(host: &mut dyn ClientHost) {
     let listener = reads.camera().map(|c| Listener { pos: c.position, yaw_degrees: c.yaw });
     let ptt_down = reads.is_down(ID, KEY_PTT.0);
     let whisper_down = reads.is_down(ID, KEY_WHISPER.0);
-    let status = with_state(reads, |s| s.client.status());
+    let mut status = with_state(reads, |s| s.client.status());
+    if status.me.is_none() {
+        let local = reads.local_player();
+        let me = local.and_then(|p| p.profile(reads)).map(|g| Uuid::from_u128(g.uuid)).or_else(|| {
+            let name = local.and_then(|p| p.entity().name(reads))?;
+            status.names.iter().find(|(_, n)| *n == name).map(|(id, _)| *id)
+        });
+        with_state(reads, |s| s.client.set_me(me));
+        status.me = me;
+    }
     let players = players(reads, &status);
     with_state(reads, |s| {
         // The mic test lasts only while the menu is open.
@@ -470,11 +506,12 @@ fn group_panel(host: &dyn ClientHost, draw: &mut dyn DrawContext, corners: &mut 
 /// if they turned voice chat off, a grey crossed-out one if they aren't connected to voice
 /// (on a server that runs it) (`ui::tag_icon_for`). Its lines, in tag font pixels from the
 /// icon's centre, and their colour.
-pub fn tag_icon(entity: u32) -> Option<(Vec<([f32; 2], [f32; 2])>, u32)> {
+pub fn tag_icon(entity: u32, name: &str) -> Option<(Vec<([f32; 2], [f32; 2])>, u32)> {
     with_existing(|s| {
         let status = s.client.status();
         let on_voice_server = status.connected;
-        let id = s.entities.get(&entity).copied();
+        // By entity, else by the name the voice server gave (a remote server's players).
+        let id = s.entities.get(&entity).copied().or_else(|| status.names.iter().find(|(_, n)| n == name).map(|(id, _)| *id));
         let icon = match id {
             Some(id) => ui::tag_icon_for(
                 status.talking.contains(&id),

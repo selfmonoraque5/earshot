@@ -101,6 +101,9 @@ pub struct Status {
     pub group_problem: Option<String>,
     /// UDP from the server by message type ("08x52 02x0"), unreadable packets, and the last problem.
     pub udp_summary: String,
+    /// Each player's name, as the voice server gave it: on a remote server the game finds other
+    /// players by name, not by UUID.
+    pub names: Vec<(Uuid, String)>,
 }
 
 /// A group as the menu shows it.
@@ -127,6 +130,8 @@ struct Inner {
     plasmo: Option<Plasmo>,
     /// Plasmo Voice's largest audio packet, from its config.
     plasmo_mtu: usize,
+    /// Our own player, as the game says: Plasmo Voice never names it (SVC's secret does).
+    me: Option<Uuid>,
     mixer: Mixer,
     outbox: Vec<(&'static str, Vec<u8>)>,
     /// `host:port` from the secret, resolved by the worker.
@@ -222,6 +227,7 @@ impl VoiceClient {
             session: Session::new(),
             plasmo: None,
             plasmo_mtu: 1024,
+            me: None,
             mixer: Mixer::new(48.0),
             outbox: Vec::new(),
             target: None,
@@ -335,6 +341,11 @@ impl VoiceClient {
         inner.mixer.set_positions(players);
         inner.ptt_down = ptt_down;
         inner.whisper_down = whisper_down;
+    }
+
+    /// Our own player, from the game.
+    pub fn set_me(&self, me: Option<Uuid>) {
+        self.shared.lock().me = me;
     }
 
     /// Plugin messages to send over the game connection now.
@@ -458,7 +469,7 @@ impl VoiceClient {
             transmitting: inner.transmitting,
             whispering: inner.transmitting && inner.whisper_down,
             talking: inner.mixer.talking(),
-            me: inner.session.player(),
+            me: inner.session.player().or(inner.me),
             voice_off,
             has_voice,
             muted: inner.muted,
@@ -473,6 +484,10 @@ impl VoiceClient {
             groups: inner.groups.iter().map(|g| group_info(&inner, g)).collect(),
             my_group: inner.my_group.and_then(|id| inner.groups.iter().find(|g| g.id == id)).map(|g| group_info(&inner, g)),
             group_problem: inner.group_problem.clone(),
+            names: match &inner.plasmo {
+                Some(p) => p.players.values().map(|x| (x.id, x.nick.clone())).collect(),
+                None => inner.players.iter().map(|(id, (name, _))| (*id, name.clone())).collect(),
+            },
         }
     }
 
