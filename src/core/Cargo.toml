@@ -1,6 +1,6 @@
 [package]
 name = "earshot-core"
-version = "2.0.10"
+version = "2.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT AND BSD-3-Clause"   # our code MIT; src/opus/ is opus-rs (BSD-3-Clause, see COPYING-opus-rs)
@@ -14,3 +14,5 @@ aes = "0.8"        # MIT OR Apache-2.0: the AES block cipher; GCM is built on it
 cpal = "0.16"      # Apache-2.0: microphone and speakers
 getrandom = "0.3"  # MIT OR Apache-2.0: random nonces
 serde_json = "1"   # MIT OR Apache-2.0: reading chat lines' JSON (src/chat.rs)
+md-5 = "0.10"      # MIT OR Apache-2.0: Plasmo Voice activation ids (Java name UUIDs, src/plasmo.rs)
+rsa = "0.9"        # MIT OR Apache-2.0: the RSA key Plasmo Voice seals its audio key with (src/plasmo.rs)

@@ -248,7 +248,7 @@ pub fn flush(host: &mut dyn ClientHost) {
 
 /// A custom payload from the server.
 pub fn plugin_message(host: &mut dyn ClientHost, channel: &str, data: &[u8], server: &str) {
-    if channel != plugin::MINECRAFT_REGISTER && !channel.starts_with("voicechat:") {
+    if channel != plugin::MINECRAFT_REGISTER && !channel.starts_with("voicechat:") && !channel.starts_with("plasmo:voice/") {
         return;
     }
     let host_name = host_of(server);

@@ -3,12 +3,16 @@
 # Earshot (Horizon mod)
 
 Proximity voice chat for [Horizon](https://playhorizon.dev/), the Rust rewrite of Minecraft: Java Edition 26.3.
-Talk to the players near you on servers that run **Simple Voice Chat**: with Java players using Simple Voice Chat,
-and with other Horizon players using Earshot.
+Talk to the players near you on servers that run **Simple Voice Chat** or **Plasmo Voice**: with Java players using
+those mods, and with other Horizon players using Earshot.
 
 > Earshot is an independent project, **not affiliated with or endorsed by Simple Voice Chat** or its author.
 > It contains no Simple Voice Chat code or assets. Its protocol support was worked out only from our own
 > network captures; see [PROTOCOL.md](PROTOCOL.md), which records where each fact came from.
+>
+> Earshot is also **not affiliated with or endorsed by Plasmo Voice** or its authors. Its Plasmo Voice support is
+> Earshot's own code, written from protocol facts read in Plasmo Voice's source (LGPL-3.0); see [PLASMO.md](PLASMO.md),
+> which credits it and names the file each fact came from.
 
 ## Screenshots
 
@@ -31,7 +35,10 @@ and with other Horizon players using Earshot.
 - A **mic icon** on the HUD (idle, talking, muted, voice off), and beside other players' name tags a **speaker icon**:
   green while they talk, red if they turned voice chat off, grey and crossed out if they aren't connected to voice
   (no voice chat mod) on a server that runs it.
-- Opus audio and AES-128-GCM encryption, as the server expects.
+- Opus audio, encrypted as the server expects: AES-128-GCM for Simple Voice Chat, AES-128-CBC (with an RSA key exchange)
+  for Plasmo Voice.
+- On a **Plasmo Voice** server: proximity voice, push to talk, voice activation, mute, deafen, per-player volume and the
+  icons. Plasmo Voice's own groups and addons aren't supported, and the server must use 48 kHz audio (its default).
 
 ## Keys
 
@@ -51,13 +58,18 @@ switch for connection details.
 - Servers running **Simple Voice Chat 2.6.27** (compatibility version 20): Fabric and Paper (the Bukkit plugin).
 - 2.0 tested in game on Windows with Simple Voice Chat servers. Earshot 1.x was also tested on Linux (PipeWire),
   but 2.0 doesn't build on Linux yet (see Compatibility).
-- A server without Simple Voice Chat: Earshot stays quiet and sends nothing.
+- Servers running **Plasmo Voice 2.x** (tested against its protocol as of 2.1.17 and 2.2.0 beta; not yet in game).
+- A server without either: Earshot stays quiet and sends nothing.
 
 ## Network use
 
 When you join a server that runs Simple Voice Chat, Earshot asks it for a voice key over the game connection.
 It uses **UDP** for encrypted (AES-128-GCM) voice packets, to the address the server names (default port 24454). It
 contacts nothing else.
+
+On a server that runs Plasmo Voice, Earshot registers Plasmo Voice's channel, sends the server an RSA public key (made
+on your computer each time the game starts) and gets back the voice address and an AES audio key sealed to that key.
+Voice packets then go over **UDP**, AES-128-CBC encrypted, to the address the server names (default port 60606).
 
 Earshot opens the microphone when voice chat is enabled, the mic is unmuted, and either the game server supplies
 voice connection details or you start the mic test. Muting closes the microphone while keeping playback available

@@ -19,6 +19,7 @@ use crate::activation::{self, Activation, Mode};
 use crate::audio::{self, AudioIo, CaptureQueue, PlaybackQueue};
 use crate::codec::{Encoder, FRAME_SAMPLES};
 use crate::mixer::Mixer;
+use crate::plasmo::{self, Plasmo};
 use crate::plugin::{self, Secret, ServerMessage};
 use crate::session::{Action, Phase, Session};
 use crate::spatial::Listener;
@@ -122,6 +123,10 @@ struct Inner {
     voice_flags: std::collections::HashMap<Uuid, (bool, bool)>,
     group_problem: Option<String>,
     session: Session,
+    /// A Plasmo Voice server's connection, when the server runs Plasmo Voice instead of SVC.
+    plasmo: Option<Plasmo>,
+    /// Plasmo Voice's largest audio packet, from its config.
+    plasmo_mtu: usize,
     mixer: Mixer,
     outbox: Vec<(&'static str, Vec<u8>)>,
     /// `host:port` from the secret, resolved by the worker.
@@ -159,7 +164,8 @@ struct Inner {
 
 impl Inner {
     fn audio_devices(&self) -> (Option<Option<String>>, Option<Option<String>>) {
-        let voice = matches!(self.session.phase, Phase::Authenticating { .. } | Phase::Checking { .. } | Phase::Connected { .. });
+        let voice = matches!(self.session.phase, Phase::Authenticating { .. } | Phase::Checking { .. } | Phase::Connected { .. })
+            || self.plasmo.as_ref().is_some_and(Plasmo::connecting);
         let test = self.mic_test && !self.muted;
         let active = self.settings.use_audio_devices && !self.session.disabled && (voice || test);
         let input = (active && !self.muted).then(|| self.settings.input_device.clone());
@@ -206,6 +212,7 @@ pub struct VoiceClient {
 
 impl VoiceClient {
     pub fn new(settings: Settings) -> Self {
+        plasmo_key_start();
         let inner = Inner {
             groups: Vec::new(),
             my_group: None,
@@ -213,6 +220,8 @@ impl VoiceClient {
             voice_flags: std::collections::HashMap::new(),
             group_problem: None,
             session: Session::new(),
+            plasmo: None,
+            plasmo_mtu: 1024,
             mixer: Mixer::new(48.0),
             outbox: Vec::new(),
             target: None,
@@ -256,7 +265,19 @@ impl VoiceClient {
         let mut inner = self.shared.lock();
         let mut event = None;
         let actions = if channel == plugin::MINECRAFT_REGISTER {
-            inner.session.on_server_register(&plugin::decode_register(data), now)
+            let channels = plugin::decode_register(data);
+            // A Plasmo Voice server: say we have the mod, and it asks for our player info.
+            if channels.iter().any(|c| c == plasmo::CHANNEL) {
+                inner.plasmo.get_or_insert_with(Plasmo::new);
+                inner.outbox.push((plugin::MINECRAFT_REGISTER, plugin::encode_register(&[plasmo::CHANNEL, plasmo::INSTALLED])));
+            }
+            inner.session.on_server_register(&channels, now)
+        } else if channel == plasmo::CHANNEL {
+            let p = inner.plasmo.get_or_insert_with(Plasmo::new);
+            (p.voice_disabled, p.mic_muted) = (false, false);
+            let todo = p.on_tcp(data, plasmo_key(), game_host, now);
+            run_plasmo(&mut inner, todo);
+            vec![]
         } else {
             match ServerMessage::decode(channel, data) {
                 Some(Ok(ServerMessage::Secret(secret))) => on_secret(&mut inner, secret, game_host, now),
@@ -327,6 +348,7 @@ impl VoiceClient {
             inner.reset_capture();
         }
         inner.muted = muted;
+        plasmo_state(&mut inner);
     }
 
     pub fn set_deafened(&self, deafened: bool) {
@@ -344,6 +366,7 @@ impl VoiceClient {
         let actions = inner.session.set_disabled(disabled);
         inner.mixer.deafened = disabled || inner.deafened;
         run_actions(&mut inner, actions);
+        plasmo_state(&mut inner);
     }
 
     /// Makes a group of this type and joins it (`create_group`, captures 06 and 07).
@@ -410,15 +433,34 @@ impl VoiceClient {
                 format!("{connection} [UDP {to}: sent {}, got {}{err}]", inner.udp_sent, inner.udp_received)
             }
         };
+        let connection = match &inner.plasmo {
+            Some(p) if !p.connected() && p.connecting() => {
+                let to = inner.target.as_ref().map(|(h, port)| format!("{h}:{port}")).unwrap_or_else(|| "no address".into());
+                let err = inner.udp_error.as_ref().map(|e| format!(", error: {e}")).unwrap_or_default();
+                format!("{} [UDP {to}: sent {}, got {}{err}]", p.describe(), inner.udp_sent, inner.udp_received)
+            }
+            Some(p) => p.describe(),
+            None => connection,
+        };
+        let (voice_off, has_voice) = match &inner.plasmo {
+            Some(p) => (
+                p.players.values().filter(|x| x.voice_disabled).map(|x| x.id).collect(),
+                p.players.values().filter(|x| !x.voice_disabled).map(|x| x.id).collect(),
+            ),
+            None => (
+                inner.voice_flags.iter().filter(|(_, f)| f.0).map(|(id, _)| *id).collect(),
+                inner.voice_flags.iter().filter(|(_, f)| !f.1).map(|(id, _)| *id).collect(),
+            ),
+        };
         Status {
             connection,
-            connected: inner.session.is_connected(),
+            connected: inner.session.is_connected() || inner.plasmo.as_ref().is_some_and(Plasmo::connected),
             transmitting: inner.transmitting,
             whispering: inner.transmitting && inner.whisper_down,
             talking: inner.mixer.talking(),
             me: inner.session.player(),
-            voice_off: inner.voice_flags.iter().filter(|(_, f)| f.0).map(|(id, _)| *id).collect(),
-            has_voice: inner.voice_flags.iter().filter(|(_, f)| !f.1).map(|(id, _)| *id).collect(),
+            voice_off,
+            has_voice,
             muted: inner.muted,
             deafened: inner.deafened,
             disabled: inner.session.disabled,
@@ -438,6 +480,7 @@ impl VoiceClient {
     pub fn disconnect(&self) {
         let mut inner = self.shared.lock();
         inner.session.reset();
+        inner.plasmo = None;
         inner.reset_capture();
         inner.socket = None;
         inner.target = None;
@@ -551,6 +594,89 @@ fn run_actions(inner: &mut Inner, actions: Vec<Action>) {
                 inner.reset_capture();
             }
         }
+    }
+}
+
+// --- Plasmo Voice ------------------------------------------------------------------------------
+
+/// The RSA key pair Plasmo Voice servers seal the audio key with: made once, in the background,
+/// as a 2048-bit key takes a moment. Until it's ready the server's request waits (it repeats it).
+static PLASMO_KEY: std::sync::OnceLock<Option<plasmo::KeyPair>> = std::sync::OnceLock::new();
+
+fn plasmo_key_start() {
+    if PLASMO_KEY.get().is_none() {
+        let _ = std::thread::Builder::new().name("earshot-key".into()).spawn(|| {
+            PLASMO_KEY.get_or_init(|| plasmo::KeyPair::generate(2048).map_err(|e| eprintln!("[earshot] no Plasmo Voice key: {e}")).ok());
+        });
+    }
+}
+
+fn plasmo_key() -> Option<&'static plasmo::KeyPair> {
+    PLASMO_KEY.get().and_then(Option::as_ref)
+}
+
+/// Our mute and voice-off state, for a Plasmo Voice server.
+fn plasmo_state(inner: &mut Inner) {
+    let (muted, disabled) = (inner.muted, inner.session.disabled);
+    if let Some(p) = inner.plasmo.as_mut() {
+        (p.mic_muted, p.voice_disabled) = (muted, disabled);
+        if p.connected() {
+            inner.outbox.push((plasmo::CHANNEL, plasmo::player_state(disabled, muted)));
+        }
+    }
+}
+
+/// Carries out what the Plasmo Voice connection asked for.
+fn run_plasmo(inner: &mut Inner, todo: Vec<plasmo::Do>) {
+    for d in todo {
+        match d {
+            plasmo::Do::Tcp(data) => inner.outbox.push((plasmo::CHANNEL, data)),
+            plasmo::Do::Udp(data) => send_raw(inner, &data),
+            plasmo::Do::Open { host, port } => {
+                inner.target = Some((host, port));
+                inner.socket = None;
+                inner.udp_sent = 0;
+                inner.udp_received = 0;
+                inner.udp_error = None;
+                inner.mic_frames_sent = 0;
+                inner.voice_frames_received = 0;
+            }
+            plasmo::Do::Ready { codec, mtu, distance } => {
+                eprintln!("[earshot] voice connected (Plasmo Voice)");
+                inner.plasmo_mtu = mtu;
+                inner.mixer.set_max_distance(distance as f64);
+                inner.encoder = match Encoder::new(codec) {
+                    Ok(e) => Some(e),
+                    Err(e) => {
+                        eprintln!("[earshot] {e}");
+                        None
+                    }
+                };
+            }
+            plasmo::Do::Audio { source, player, sequence, opus, distance } => {
+                inner.voice_frames_received += 1;
+                match player {
+                    // A player's voice comes from where that player is.
+                    Some(p) => inner.mixer.push_ranged(p, sequence, opus, distance),
+                    // Anything else (not yet known, or not placed): heard as is.
+                    None => inner.mixer.push_group(source, sequence, opus),
+                }
+            }
+            plasmo::Do::Lost(why) => {
+                eprintln!("[earshot] voice: {why}");
+                inner.socket = None;
+                inner.reset_capture();
+            }
+        }
+    }
+}
+
+/// A ready-made datagram to the voice server.
+fn send_raw(inner: &mut Inner, data: &[u8]) {
+    let Some(socket) = &inner.socket else { return };
+    match socket.send(data) {
+        Ok(_) => inner.udp_sent += 1,
+        Err(e) => inner.udp_error = Some(e.to_string()),
     }
 }
 
@@ -672,13 +798,13 @@ fn worker(shared: Arc<Shared>) {
         // The socket first: made once we know where the voice server is.
         let socket = {
             let mut inner = shared.lock();
-            if inner.socket.is_none() && matches!(inner.session.phase, Phase::Authenticating { .. }) {
+            let wants = |inner: &Inner| matches!(inner.session.phase, Phase::Authenticating { .. }) || inner.plasmo.as_ref().is_some_and(Plasmo::connecting);
+            if inner.socket.is_none() && wants(&inner) {
                 if let Some((host, port)) = inner.target.clone() {
                     drop(inner);
                     let opened = open_socket(&host, port);
                     inner = shared.lock();
-                    if !matches!(inner.session.phase, Phase::Authenticating { .. })
-                        || !inner.target.as_ref().is_some_and(|(h, p)| *h == host && *p == port)
+                    if !wants(&inner) || !inner.target.as_ref().is_some_and(|(h, p)| *h == host && *p == port)
                     {
                         continue;
                     }
@@ -686,6 +812,11 @@ fn worker(shared: Arc<Shared>) {
                         Ok(s) => {
                             eprintln!("[earshot] voice server: udp {host}:{port}, from {:?}", s.local_addr());
                             inner.socket = Some(s);
+                            // Plasmo Voice: say hello now.
+                            if let Some(p) = inner.plasmo.as_mut() {
+                                let todo = p.poll(now);
+                                run_plasmo(&mut inner, todo);
+                            }
                             // Don't wait for the next retry: log in now.
                             let auth = inner
                                 .session
@@ -716,6 +847,12 @@ fn worker(shared: Arc<Shared>) {
             while Instant::now() < batch_end {
                 let Ok(n) = socket.recv(&mut buf) else { break };
                 let mut inner = shared.lock();
+                if let Some(p) = inner.plasmo.as_mut() {
+                    let todo = p.on_udp(&buf[..n], shared.now());
+                    inner.udp_received += 1;
+                    run_plasmo(&mut inner, todo);
+                    continue;
+                }
                 let Some(key) = inner.session.key().cloned() else { break };
                 inner.udp_received += 1;
                 let decoded = udp::open_raw_from_server(&key, &buf[..n])
@@ -755,6 +892,10 @@ fn worker(shared: Arc<Shared>) {
         // A fresh reading: the game thread may have moved the session on since `now`.
         let actions = inner.session.poll(shared.now());
         run_actions(&mut inner, actions);
+        if let Some(p) = inner.plasmo.as_mut() {
+            let todo = p.poll(shared.now());
+            run_plasmo(&mut inner, todo);
+        }
 
         // Microphone: one Opus frame per 960 captured samples.
         loop {
@@ -810,12 +951,19 @@ fn send_mic_frame(inner: &mut Inner, mut frame: [f32; FRAME_SAMPLES]) {
     }
     // Holding the whisper key sends whatever the mode (as SVC's whisper key did in capture 07).
     let wants = inner.activation.frame(inner.level, inner.ptt_down) || inner.whisper_down;
-    let send = wants && inner.session.is_connected();
+    let plasmo_on = inner.plasmo.as_ref().is_some_and(Plasmo::connected);
+    let send = wants && (inner.session.is_connected() || plasmo_on);
+    let was = inner.transmitting;
     inner.transmitting = send;
     if !send {
+        // Plasmo Voice hears when we stop.
+        if was && let Some(end) = inner.plasmo.as_ref().and_then(Plasmo::stopped) {
+            inner.outbox.push((plasmo::CHANNEL, end));
+        }
         return;
     }
-    let mtu = inner.session.secret().map(|s| s.mtu.max(1) as usize).unwrap_or(1275);
+    // Plasmo Voice's MTU bounds the sealed packet: leave room for the IV and padding.
+    let mtu = if plasmo_on { inner.plasmo_mtu.saturating_sub(64).max(64) } else { inner.session.secret().map(|s| s.mtu.max(1) as usize).unwrap_or(1275) };
     let Some(encoder) = inner.encoder.as_mut() else { return };
     let opus = match encoder.encode(&frame, mtu) {
         Ok(p) => p,
@@ -824,6 +972,13 @@ fn send_mic_frame(inner: &mut Inner, mut frame: [f32; FRAME_SAMPLES]) {
             return;
         }
     };
+    if let Some(p) = inner.plasmo.as_mut().filter(|p| p.connected()) {
+        if let Some(packet) = p.audio(&opus) {
+            inner.mic_frames_sent += 1;
+            send_raw(inner, &packet);
+        }
+        return;
+    }
     // The last byte: 1 while whispering, 0 otherwise (capture 07).
     let msg = Message::Mic(MicFrame { opus, sequence: inner.sequence, flag: inner.whisper_down as u8 });
     inner.sequence += 1;
@@ -1058,6 +1213,64 @@ mod tests {
         client.set_disabled(true);
         assert_eq!(client.take_outgoing(), [(plugin::UPDATE_STATE, vec![1])]);
         assert!(client.status().disabled);
+
+        client.disconnect();
+        assert!(!client.status().connected);
+    }
+
+    #[test]
+    fn connects_to_a_fake_plasmo_voice_server() {
+        use crate::plasmo::{AudioCipher, fake_server as fake};
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let client = VoiceClient::new(Settings { use_audio_devices: false, ..Settings::default() });
+
+        // 1. The server's register: we register Plasmo Voice's channels back.
+        client.on_plugin(plugin::MINECRAFT_REGISTER, &plugin::encode_register(&[plasmo::CHANNEL]), "127.0.0.1");
+        assert_eq!(client.take_outgoing(), [(plugin::MINECRAFT_REGISTER, plugin::encode_register(&[plasmo::CHANNEL, plasmo::INSTALLED]))]);
+
+        // 2. Asked for our info (once the key is made), we send the public key.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while plasmo_key().is_none() {
+            assert!(Instant::now() < deadline, "no key");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        client.on_plugin(plasmo::CHANNEL, &fake::request(), "127.0.0.1");
+        let out = client.take_outgoing();
+        assert_eq!(out.len(), 1);
+        let public = fake::public_key_of(&out[0].1);
+
+        // 3. The secret and address: the client pings the voice server.
+        let secret = Uuid([5; 16]);
+        client.on_plugin(plasmo::CHANNEL, &fake::connection(&secret, "0.0.0.0", port), "127.0.0.1");
+        let mut buf = [0u8; 2048];
+        let (n, from) = server.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..4], &0x4e90_04e9i32.to_be_bytes());
+        assert_eq!(buf[4], 1, "a ping");
+        assert_eq!(&buf[5..21], &secret.0);
+        assert!(n > 29, "with the address it reached");
+
+        // 4. The config, its audio key sealed to our public key: connected.
+        let aes_key = [3u8; 16];
+        client.on_plugin(plasmo::CHANNEL, &fake::config_packet(&Uuid([1; 16]), &fake::seal_key(&public, &aes_key)), "127.0.0.1");
+        wait_for("connected", || client.status().connected);
+        assert!(client.status().connection.contains("Plasmo"));
+
+        // 5. Alice's voice: once the server says the source is hers, it reaches the mixer as hers.
+        let (source, alice) = (Uuid([7; 16]), Uuid([8; 16]));
+        client.on_plugin(plasmo::CHANNEL, &fake::player_source(&source, &alice, "Alice"), "127.0.0.1");
+        let cipher = AudioCipher::new(&aes_key).unwrap();
+        let mut enc = Encoder::new(Codec::Voip).unwrap();
+        for seq in 1..=5 {
+            let opus = enc.encode(&[0.1; FRAME_SAMPLES], 1275).unwrap();
+            server.send_to(&fake::source_audio(&secret, &cipher, seq, &source, &opus), from).unwrap();
+        }
+        wait_for("alice talking", || client.status().talking.contains(&alice));
+
+        // 6. Muting tells the server.
+        client.set_muted(true);
+        assert_eq!(client.take_outgoing(), [(plasmo::CHANNEL, plasmo::player_state(false, true))]);
 
         client.disconnect();
         assert!(!client.status().connected);

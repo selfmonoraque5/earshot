@@ -32,6 +32,7 @@ pub mod engine;
 pub mod jitter;
 pub mod menu;
 pub mod mixer;
+pub mod plasmo;
 pub mod plugin;
 pub mod resample;
 pub mod server;
