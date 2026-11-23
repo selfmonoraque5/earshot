@@ -79,7 +79,7 @@ changed.
 
 From GitHub:
 
-1. Download `earshot-2.0.7.hmod` from the [latest release](https://github.com/selfmonoraque5/earshot/releases/latest).
+1. Download the `earshot-….hmod` file from the [latest release](https://github.com/selfmonoraque5/earshot/releases/latest).
 2. Put it in the `horizon-native-mods` folder of your game folder, not in `mods`. On Windows that is
    `%APPDATA%\horizon\horizon-native-mods`.
 3. In the launcher, open the Mods page and click **Build** (the first build downloads the mod SDK and takes a few

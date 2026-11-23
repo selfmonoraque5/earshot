@@ -252,11 +252,17 @@ pub fn plugin_message(host: &mut dyn ClientHost, channel: &str, data: &[u8], ser
         return;
     }
     let host_name = host_of(server);
+    let group_update = matches!(channel, plugin::JOINED_GROUP | plugin::ADD_GROUP | plugin::REMOVE_GROUP);
+    let menu_open = host.mod_screen() == Some(ID);
     with_state(&*host, |s| {
         s.client.on_plugin(channel, data, &host_name);
-        if matches!(channel, plugin::JOINED_GROUP | plugin::ADD_GROUP | plugin::REMOVE_GROUP) {
-            let status = s.client.status();
-            s.menu.sync_group(status.my_group.is_some(), |id| status.groups.iter().any(|group| group.id == id));
+        // Only an open create or password page moves on a group update, with two direct reads.
+        if group_update
+            && menu_open
+            && let Some(form) = s.menu.group_form()
+        {
+            let (in_group, listed) = s.client.group_state(form);
+            s.menu.sync_group(in_group, |_| listed);
         }
     });
     flush(host);

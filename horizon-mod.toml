@@ -1,6 +1,6 @@
 id = "earshot"
 name = "Earshot"
-version = "2.0.8"
+version = "2.0.9"
 description = "Proximity voice chat that works with Simple Voice Chat servers: 3D audio, push to talk, whisper, voice groups. An independent project, not affiliated with Simple Voice Chat."
 authors = ["selfmonoraque5"]
 license = "MIT AND BSD-3-Clause"

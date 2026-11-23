@@ -386,6 +386,14 @@ impl VoiceClient {
         inner.settings = settings;
     }
 
+    /// Whether this client is in a group, and whether `group` is one the server listed: two
+    /// direct reads for the menu, without building a `Status`.
+    pub fn group_state(&self, group: Option<Uuid>) -> (bool, bool) {
+        let inner = self.shared.lock();
+        let listed = group.is_some_and(|id| inner.groups.iter().any(|g| g.id == id));
+        (inner.my_group.is_some(), listed)
+    }
+
     pub fn status(&self) -> Status {
         let inner = self.shared.lock();
         let connection = match &inner.session.phase {

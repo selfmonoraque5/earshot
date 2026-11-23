@@ -351,6 +351,16 @@ impl Menu {
         }
     }
 
+    /// The group form shown, if any: `Some(None)` for creating a group, `Some(Some(id))` for the
+    /// password of group `id`. Only these pages follow the server's group changes.
+    pub fn group_form(&self) -> Option<Option<Uuid>> {
+        match self.page {
+            Page::CreateGroup => Some(None),
+            Page::Password(id) => Some(Some(id)),
+            _ => None,
+        }
+    }
+
     /// Apply a server-side group change to the stored page and its keyboard focus.
     pub fn sync_group(&mut self, in_group: bool, group_exists: impl FnOnce(Uuid) -> bool) {
         let page = self.group_page(in_group, group_exists);
@@ -1050,6 +1060,19 @@ mod tests {
         let mut menu = Menu::new();
         click(&mut menu, &m, Id::Go(Page::Groups));
         assert_eq!(click(&mut menu, &m, Id::Group(Uuid([8; 16]))), Some(MenuAction::JoinGroup(Uuid([8; 16]), None)));
+    }
+
+    #[test]
+    fn only_the_group_forms_follow_group_updates() {
+        let mut menu = Menu::new();
+        assert_eq!(menu.group_form(), None, "the main page ignores group updates");
+        menu.go(Page::Groups);
+        assert_eq!(menu.group_form(), None);
+        menu.go(Page::CreateGroup);
+        assert_eq!(menu.group_form(), Some(None));
+        let id = Uuid([3; 16]);
+        menu.go(Page::Password(id));
+        assert_eq!(menu.group_form(), Some(Some(id)));
     }
 
     #[test]
